@@ -1,0 +1,27 @@
+[package]
+name = "DAT6_KubernetesController"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# Optional: HTTP health/liveness endpoints
+health = ["dep:axum", "dep:tower"]
+# Optional: Prometheus metrics
+metrics = ["dep:prometheus", "dep:axum", "dep:tower"]
+
+[dependencies]
+kube = { version = "0.92", features = ["runtime", "client", "derive"] }
+k8s-openapi = { version = "0.22", features = ["latest"] }
+thiserror = "1.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Optional dependencies (enable via features)
+axum = { version = "0.7", optional = true }
+tower = { version = "0.4", optional = true }
+prometheus = { version = "0.13", optional = true }
