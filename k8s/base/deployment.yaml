@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drainable-service
+  labels:
+    app: drainable-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: drainable-service
+  template:
+    metadata:
+      labels:
+        app: drainable-service
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: drainable-service
+          image: drainable-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: SLEEP_MS
+              value: "0"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            timeoutSeconds: 1
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 1
+          # terminationGracePeriodSeconds and preStop are patched per overlay
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: drainable-service
+  labels:
+    app: drainable-service
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: drainable-service

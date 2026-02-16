@@ -1,0 +1,34 @@
+# kube-prometheus-stack — minimal values for baseline testbed
+# Helm: prometheus-community/kube-prometheus-stack
+
+prometheus:
+  prometheusSpec:
+    retention: 2h
+    scrapeInterval: 15s
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    # Scrape our drainable-service (add ServiceMonitor or use additionalScrapeConfigs)
+    additionalScrapeConfigs:
+      - job_name: drainable-service
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [default]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: drainable-service
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            target_label: __address__
+            replacement: ${1}:8080
+          - target_label: __metrics_path__
+            replacement: /metrics
+
+# Disable Grafana by default (optional)
+grafana:
+  enabled: false
+
+# Disable alertmanager for minimal setup
+alertmanager:
+  enabled: false

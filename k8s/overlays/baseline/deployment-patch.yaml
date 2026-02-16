@@ -1,0 +1,9 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drainable-service
+spec:
+  template:
+    spec:
+      terminationGracePeriodSeconds: 30
+      # No preStop — baseline for comparison

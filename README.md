@@ -55,7 +55,17 @@ Optional (features):
 - **axum** — health endpoints (`health` feature)
 - **prometheus** — metrics (`metrics` feature)
 
-## Run
+## Baseline + Testbed
+
+For reproducible experiments, see **[BASELINE.md](BASELINE.md)**:
+
+```bash
+make cluster-up
+make deploy-baseline
+make run SCENARIO=steady_scale_down STRAT=baseline
+```
+
+## Run (Controller)
 
 Requires kubeconfig (e.g. `~/.kube/config`) or in-cluster config.
 

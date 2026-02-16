@@ -1,0 +1,16 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drainable-service
+spec:
+  template:
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: drainable-service
+          env:
+            - name: SLEEP_MS
+              value: "0"
+            - name: LONG_REQUESTS_PCT
+              value: "5"
+          # 5% of requests sleep 2–10s (fault injection)
