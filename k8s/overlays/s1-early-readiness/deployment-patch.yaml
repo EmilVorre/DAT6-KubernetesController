@@ -1,0 +1,15 @@
+# S1 — Early Readiness Removal
+# Adds a custom readiness gate so the controller can set it to False when the pod
+# is terminating, removing the pod from Service endpoints before preStop/grace period.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drainable-service
+spec:
+  template:
+    spec:
+      terminationGracePeriodSeconds: 30
+      # Custom readiness gate: controller sets this to False on termination (S1).
+      readinessGates:
+        - conditionType: decomposition.dat6.io/drain
+      # No preStop — S1 removes traffic via readiness; optional preStop can be added per overlay

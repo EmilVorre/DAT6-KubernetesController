@@ -1,5 +1,5 @@
 # Drainable service — multi-stage build
-FROM rust:1.75-bookworm AS builder
+FROM rust:1.83-bookworm AS builder
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock* ./

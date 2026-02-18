@@ -65,6 +65,25 @@ make deploy-baseline
 make run SCENARIO=steady_scale_down STRAT=baseline
 ```
 
+## S1 — Early Readiness Removal
+
+When a pod is terminating, the controller can set a custom readiness gate to **False** so the pod is removed from Service endpoints immediately (no new traffic), then in-flight requests can drain during the grace period.
+
+1. Deploy the S1 overlay: `make deploy-baseline K8S_OVERLAY=s1-early-readiness`
+2. Run the controller with S1 enabled: `DAT6_EARLY_READINESS_REMOVAL=1 cargo run`
+3. Run scenarios: `make run SCENARIO=rollout STRAT=s1-early-readiness`
+
+## N repeats and stable metrics
+
+Run a scenario N times and get aggregated metrics (e.g. mean/min/max loss and latency):
+
+```bash
+make run-repeats N=5 SCENARIO=steady_scale_down STRAT=baseline
+make run-repeats N=5 SCENARIO=rollout STRAT=s1-early-readiness
+```
+
+Output: `runs/<timestamp>-<scenario>-<strat>-repeats/` with `run_1/` … `run_N/`, `summary_repeats.csv`, and `aggregate.json`.
+
 ## Run (Controller)
 
 Requires kubeconfig (e.g. `~/.kube/config`) or in-cluster config.

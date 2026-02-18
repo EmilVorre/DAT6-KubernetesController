@@ -35,7 +35,18 @@ async fn main() -> Result<(), kube::Error> {
         .init();
 
     let client = Client::try_default().await?;
-    let policy = DecommissionPolicy::default();
+    let policy = {
+        let mut p = DecommissionPolicy::default();
+        // S1 — Early Readiness Removal: set when using k8s/overlays/s1-early-readiness
+        p.early_readiness_removal = std::env::var("DAT6_EARLY_READINESS_REMOVAL")
+            .as_deref()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if p.early_readiness_removal {
+            info!("S1 — Early Readiness Removal enabled");
+        }
+        p
+    };
 
     let ctx = Arc::new({
         #[cfg(not(feature = "metrics"))]

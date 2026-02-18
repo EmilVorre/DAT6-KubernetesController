@@ -14,7 +14,7 @@ APP_NAMESPACE ?= default
 
 .PHONY: cluster-up cluster-down cluster-status
 .PHONY: deploy-baseline deploy-prometheus deploy-kube-state-metrics
-.PHONY: build-app load-app run clean help
+.PHONY: build-app load-app run run-repeats clean help
 
 # --- Cluster lifecycle ---
 cluster-up:
@@ -60,6 +60,11 @@ undeploy-baseline:
 run:
 	bash scripts/run_scenario.sh $(SCENARIO) $(STRAT) $(RUN_DIR)/$(TIMESTAMP)-$(SCENARIO)-$(STRAT)
 
+# --- Run scenario N times and aggregate metrics ---
+N ?= 5
+run-repeats:
+	bash scripts/run_repeats.sh $(N) $(SCENARIO) $(STRAT)
+
 # --- Full setup (cluster + prometheus + baseline) ---
 setup: cluster-up
 	@echo "Waiting for cluster to be ready..."
@@ -89,6 +94,11 @@ help:
 	@echo "Run:"
 	@echo "  make run SCENARIO=steady_scale_down STRAT=baseline"
 	@echo "  make run SCENARIO=steady_scale_down STRAT=long-requests"
+	@echo "  make run SCENARIO=rollout STRAT=s1-early-readiness"
+	@echo ""
+	@echo "Run N repeats (stable metrics):"
+	@echo "  make run-repeats N=5 SCENARIO=steady_scale_down STRAT=baseline"
+	@echo "  make run-repeats N=5 SCENARIO=rollout STRAT=s1-early-readiness"
 	@echo ""
 	@echo "Full setup:"
 	@echo "  make setup               cluster-up + prometheus + baseline"

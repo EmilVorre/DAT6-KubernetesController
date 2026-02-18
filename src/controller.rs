@@ -11,11 +11,13 @@ use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::controller::{Action, Controller};
 use kube::{Api, Client, ResourceExt};
+use kube::api::{Patch, PatchParams};
+use serde_json::json;
 use tracing::{info, instrument, warn};
 
 use crate::decommission::DecommissionState;
 use crate::error::{Error, Result};
-use crate::policy::{DecommissionPolicy, PolicyDecision, PolicyEngine};
+use crate::policy::{DecommissionPolicy, PolicyDecision, PolicyEngine, READINESS_GATE_CONDITION_TYPE};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -95,6 +97,19 @@ pub async fn reconcile_pod(obj: Arc<Pod>, ctx: Arc<ControllerContext>) -> Result
 
     match decision {
         PolicyDecision::NoAction => {}
+        PolicyDecision::EnsureReadinessRemoved { requeue_after_secs } => {
+            // S1 — Early Readiness Removal: patch pod status so our readiness gate is False.
+            if has_readiness_gate(&obj, READINESS_GATE_CONDITION_TYPE) {
+                let ns = obj.namespace().unwrap_or_default();
+                let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
+                if let Err(e) = patch_pod_readiness_gate_false(&pods, &name, &obj).await {
+                    warn!(pod = %name, error = %e, "failed to patch pod readiness gate");
+                    return Ok(Action::requeue(Duration::from_secs(2)));
+                }
+                info!(pod = %name, "set readiness gate to False (S1 early removal)");
+            }
+            return Ok(Action::requeue(Duration::from_secs(requeue_after_secs)));
+        }
         PolicyDecision::DelayDeletion { requeue_after_secs, .. } => {
             return Ok(Action::requeue(Duration::from_secs(requeue_after_secs)));
         }
@@ -130,6 +145,57 @@ fn read_fsm_state_from_pod(pod: &Pod) -> DecommissionState {
         Some("deletion_allowed") => DecommissionState::DeletionAllowed,
         _ => DecommissionState::Unknown,
     }
+}
+
+/// True if the pod spec has a readinessGate for our condition type (S1).
+fn has_readiness_gate(pod: &Pod, condition_type: &str) -> bool {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.readiness_gates.as_ref())
+        .map(|gates| gates.iter().any(|g| g.condition_type == condition_type))
+        .unwrap_or(false)
+}
+
+/// Patch pod status to set our readiness gate condition to False (S1 — early readiness removal).
+async fn patch_pod_readiness_gate_false(
+    pods: &Api<Pod>,
+    name: &str,
+    pod: &Pod,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut conditions: Vec<serde_json::Value> = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .map(|c| {
+            c.iter()
+                .filter(|cond| cond.type_ != READINESS_GATE_CONDITION_TYPE)
+                .map(|cond| {
+                    json!({
+                        "type": cond.type_,
+                        "status": cond.status,
+                        "lastProbeTime": cond.last_probe_time,
+                        "lastTransitionTime": cond.last_transition_time,
+                        "reason": cond.reason,
+                        "message": cond.message,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    conditions.push(json!({
+        "type": READINESS_GATE_CONDITION_TYPE,
+        "status": "False",
+        "lastTransitionTime": now,
+        "reason": "EarlyReadinessRemoval",
+        "message": "S1: removed from Service endpoints before drain",
+    }));
+    let patch = json!({ "status": { "conditions": conditions } });
+    let params = PatchParams::default();
+    pods.patch_status(name, &params, &Patch::Merge(patch))
+        .await
+        .map_err(Error::from)?;
+    Ok(())
 }
 
 pub fn error_policy_pod(

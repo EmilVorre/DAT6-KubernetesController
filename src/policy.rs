@@ -17,6 +17,10 @@ pub struct DecommissionPolicy {
     pub traffic_drain: TrafficDrainPolicy,
     /// Require verification that the pod is no longer ready (endpoints removed) before deletion.
     pub verify_readiness_loss: bool,
+    /// **S1 — Early Readiness Removal:** When a pod is terminating, set custom readiness gate
+    /// to False so the pod is removed from Service endpoints immediately (stops new traffic),
+    /// then allow in-flight requests to drain.
+    pub early_readiness_removal: bool,
     /// Optional: validate state handover (e.g. migration, backup) before deletion.
     pub state_handover: Option<StateHandoverConfig>,
 }
@@ -60,6 +64,8 @@ pub struct StateHandoverConfig {
 pub enum PolicyDecision {
     /// No action; pod is not terminating or policy does not apply.
     NoAction,
+    /// **S1:** Set custom readiness gate to False so pod is removed from Service endpoints.
+    EnsureReadinessRemoved { requeue_after_secs: u64 },
     /// Delay deletion (e.g. traffic not yet drained).
     DelayDeletion { reason: String, requeue_after_secs: u64 },
     /// Inject or ensure preStop hook is present; then requeue.
@@ -73,21 +79,27 @@ pub enum PolicyDecision {
 /// Policy engine: given current pod/workload state and policy, returns the next decision.
 pub struct PolicyEngine;
 
+/// Condition type for S1 — Early Readiness Removal (must match pod spec readinessGates).
+pub const READINESS_GATE_CONDITION_TYPE: &str = "decomposition.dat6.io/drain";
+
 impl PolicyEngine {
     /// Evaluate what to do for this pod based on policy and current cluster state.
     ///
-    /// **Extension point:** Implement full logic using:
-    /// - `policy` (from annotations, CRD, or global config)
-    /// - Pod status (terminating, ready, conditions)
-    /// - Optional: Service endpoints (traffic drain), StatefulSet/Deployment metadata (ordering)
+    /// **S1 — Early Readiness Removal:** When enabled and pod is terminating but still ready,
+    /// we return EnsureReadinessRemoved so the controller patches our readiness gate to False,
+    /// removing the pod from Service endpoints before preStop/grace period.
     pub fn evaluate(
-        _policy: &DecommissionPolicy,
+        policy: &DecommissionPolicy,
         _pod_name: &str,
-        _is_terminating: bool,
-        _is_ready: bool,
+        is_terminating: bool,
+        is_ready: bool,
         _fsm_state: &crate::decommission::DecommissionState,
     ) -> PolicyDecision {
-        // TODO: implement full policy evaluation
+        // S1: as soon as pod is terminating, remove it from readiness so it stops receiving traffic
+        if policy.early_readiness_removal && is_terminating && is_ready {
+            return PolicyDecision::EnsureReadinessRemoved { requeue_after_secs: 1 };
+        }
+        // TODO: full policy evaluation (DelayDeletion, EnsurePreStop, AllowDeletion, etc.)
         PolicyDecision::NoAction
     }
 }
