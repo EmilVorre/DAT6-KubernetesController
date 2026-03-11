@@ -84,6 +84,12 @@ make run-repeats N=5 SCENARIO=rollout STRAT=s1-early-readiness
 
 Output: `runs/<timestamp>-<scenario>-<strat>-repeats/` with `run_1/` … `run_N/`, `summary_repeats.csv`, and `aggregate.json`.
 
+### Why run_2+ can show 0% loss (steady_scale_down)
+
+For `steady_scale_down` we scale the deployment **to 2** during load. After run_1 the cluster is left at 2 replicas. On run_2 we run `kubectl apply -k` again; the applied manifest has `replicas: 3` (from the base), but **`kubectl apply` does a three-way merge using `last-applied-configuration`**. That annotation was set when we first applied (with replicas: 3); when we later ran `kubectl scale ... --replicas=2`, the annotation was **not** updated. So on the next apply, kubectl sees “desired = 3, last-applied = 3” and sends no patch — the live replicas stay at 2. Then we run “scale to 2” again, which is a **no-op**. So only run_1 actually performs a scale-down; run_2+ see no churn and report 0% loss.
+
+To make every repeat perform a real scale-down, the scenario now **explicitly scales back to 3** at the start when using `steady_scale_down`, so each run starts with 3 replicas and then scales to 2 under load.
+
 ## Run (Controller)
 
 Requires kubeconfig (e.g. `~/.kube/config`) or in-cluster config.

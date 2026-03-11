@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 Summarize a run: parse k6 JSON output, produce summary.csv and client_results.json.
+
+Assumes k6 emits one Point per request for http_reqs and one per request for
+http_req_failed (value 0 or 1). Loss = errors / total_requests * 100.
 """
 import json
 import os
@@ -38,6 +41,11 @@ def main():
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
 
+    # k6 JSON: one Point per request for http_reqs and http_req_failed (value 0 or 1)
+    if errors > total:
+        # Inconsistent stream (e.g. different emit order); cap and warn
+        errors = total
+        print("Warning: error count exceeded total requests; capping loss at 100%", file=sys.stderr)
     loss_pct = (errors / total * 100) if total > 0 else 0
     durations_sorted = sorted(http_durations) if http_durations else [0]
     n = len(durations_sorted)

@@ -2,6 +2,9 @@
 """
 Collect metrics from Prometheus for a run.
 Output: OUTPUT_DIR/prom_snapshot.json (optional), OUTPUT_DIR/shutdown_timeline.json
+
+Note: Request loss rate is computed from k6 output by summarize_run.py (client_results.json),
+then aggregated across repeats by aggregate_repeats.py (summary_repeats.csv / aggregate.json).
 """
 import json
 import os

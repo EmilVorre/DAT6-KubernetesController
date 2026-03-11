@@ -37,10 +37,7 @@ pub enum DecommissionEvent {
 }
 
 /// Decommission FSM: given current state and event, returns next state (and optional side effect).
-pub fn transition(
-    current: DecommissionState,
-    event: DecommissionEvent,
-) -> DecommissionState {
+pub fn transition(current: DecommissionState, event: DecommissionEvent) -> DecommissionState {
     use DecommissionEvent as E;
     use DecommissionState as S;
 

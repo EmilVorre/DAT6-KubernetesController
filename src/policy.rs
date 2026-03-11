@@ -35,7 +35,10 @@ pub enum GracefulShutdownOrdering {
     /// By StatefulSet-style ordinal (higher index first, or configurable).
     ByOrdinal { drain_high_first: bool },
     /// By custom label value (e.g. "role=leader" last).
-    ByLabel { label_key: String, drain_last_values: Vec<String> },
+    ByLabel {
+        label_key: String,
+        drain_last_values: Vec<String>,
+    },
 }
 
 /// When to consider traffic drained (before proceeding to deletion).
@@ -67,7 +70,10 @@ pub enum PolicyDecision {
     /// **S1:** Set custom readiness gate to False so pod is removed from Service endpoints.
     EnsureReadinessRemoved { requeue_after_secs: u64 },
     /// Delay deletion (e.g. traffic not yet drained).
-    DelayDeletion { reason: String, requeue_after_secs: u64 },
+    DelayDeletion {
+        reason: String,
+        requeue_after_secs: u64,
+    },
     /// Inject or ensure preStop hook is present; then requeue.
     EnsurePreStop { requeue_after_secs: u64 },
     /// Allow deletion to proceed (remove finalizer if we added one, or do nothing).
@@ -97,7 +103,9 @@ impl PolicyEngine {
     ) -> PolicyDecision {
         // S1: as soon as pod is terminating, remove it from readiness so it stops receiving traffic
         if policy.early_readiness_removal && is_terminating && is_ready {
-            return PolicyDecision::EnsureReadinessRemoved { requeue_after_secs: 1 };
+            return PolicyDecision::EnsureReadinessRemoved {
+                requeue_after_secs: 1,
+            };
         }
         // TODO: full policy evaluation (DelayDeletion, EnsurePreStop, AllowDeletion, etc.)
         PolicyDecision::NoAction

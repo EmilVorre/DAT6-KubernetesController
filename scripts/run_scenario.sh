@@ -29,6 +29,14 @@ echo "Ensuring overlay $STRAT is applied..."
 kubectl apply -k "$SCRIPT_DIR/k8s/overlays/$STRAT" --wait=true 2>/dev/null || true
 kubectl rollout status deployment/drainable-service -n default --timeout=120s 2>/dev/null || true
 
+# For steady_scale_down, ensure we start with 3 replicas so "scale to 2" is a real scale-down.
+# (After run_1 the cluster is at 2; kubectl apply does not reset replicas due to last-applied-configuration.)
+if [[ "$SCENARIO" == "steady_scale_down" ]]; then
+  echo "Resetting replicas to 3 for scale-down repeat..."
+  kubectl scale deployment drainable-service -n default --replicas=3
+  kubectl rollout status deployment/drainable-service -n default --timeout=120s 2>/dev/null || true
+fi
+
 # Port-forward in background
 kubectl port-forward svc/drainable-service 8080:80 -n default &
 PF_PID=$!

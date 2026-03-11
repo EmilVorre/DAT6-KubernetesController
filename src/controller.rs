@@ -9,15 +9,17 @@ use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::core::v1::Pod;
+use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::{Api, Client, ResourceExt};
-use kube::api::{Patch, PatchParams};
 use serde_json::json;
 use tracing::{info, instrument, warn};
 
 use crate::decommission::DecommissionState;
 use crate::error::{Error, Result};
-use crate::policy::{DecommissionPolicy, PolicyDecision, PolicyEngine, READINESS_GATE_CONDITION_TYPE};
+use crate::policy::{
+    DecommissionPolicy, PolicyDecision, PolicyEngine, READINESS_GATE_CONDITION_TYPE,
+};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -74,7 +76,10 @@ pub async fn reconcile_pod(obj: Arc<Pod>, ctx: Arc<ControllerContext>) -> Result
         .status
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
-        .map(|c| c.iter().any(|cond| cond.type_ == "Ready" && cond.status == "True"))
+        .map(|c| {
+            c.iter()
+                .any(|cond| cond.type_ == "Ready" && cond.status == "True")
+        })
         .unwrap_or(false);
 
     info!(
@@ -87,13 +92,7 @@ pub async fn reconcile_pod(obj: Arc<Pod>, ctx: Arc<ControllerContext>) -> Result
     // Current FSM state (in real impl: read from pod annotation or in-memory store).
     let fsm_state = read_fsm_state_from_pod(&obj);
 
-    let decision = PolicyEngine::evaluate(
-        &ctx.policy,
-        &name,
-        is_terminating,
-        is_ready,
-        &fsm_state,
-    );
+    let decision = PolicyEngine::evaluate(&ctx.policy, &name, is_terminating, is_ready, &fsm_state);
 
     match decision {
         PolicyDecision::NoAction => {}
@@ -110,7 +109,9 @@ pub async fn reconcile_pod(obj: Arc<Pod>, ctx: Arc<ControllerContext>) -> Result
             }
             return Ok(Action::requeue(Duration::from_secs(requeue_after_secs)));
         }
-        PolicyDecision::DelayDeletion { requeue_after_secs, .. } => {
+        PolicyDecision::DelayDeletion {
+            requeue_after_secs, ..
+        } => {
             return Ok(Action::requeue(Duration::from_secs(requeue_after_secs)));
         }
         PolicyDecision::EnsurePreStop { requeue_after_secs } => {
@@ -157,11 +158,7 @@ fn has_readiness_gate(pod: &Pod, condition_type: &str) -> bool {
 }
 
 /// Patch pod status to set our readiness gate condition to False (S1 — early readiness removal).
-async fn patch_pod_readiness_gate_false(
-    pods: &Api<Pod>,
-    name: &str,
-    pod: &Pod,
-) -> Result<()> {
+async fn patch_pod_readiness_gate_false(pods: &Api<Pod>, name: &str, pod: &Pod) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut conditions: Vec<serde_json::Value> = pod
         .status
@@ -198,11 +195,7 @@ async fn patch_pod_readiness_gate_false(
     Ok(())
 }
 
-pub fn error_policy_pod(
-    object: Arc<Pod>,
-    err: &Error,
-    _ctx: Arc<ControllerContext>,
-) -> Action {
+pub fn error_policy_pod(object: Arc<Pod>, err: &Error, _ctx: Arc<ControllerContext>) -> Action {
     warn!(
         pod = %object.name_any(),
         error = %err,

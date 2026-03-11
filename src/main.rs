@@ -74,13 +74,13 @@ async fn main() -> Result<(), kube::Error> {
 
     info!("starting watchers: Pods, Deployments, StatefulSets");
 
-    let pod_fut = pod_controller(pods).run(reconcile_pod, error_policy_pod, ctx.clone()).for_each(
-        |res| async move {
+    let pod_fut = pod_controller(pods)
+        .run(reconcile_pod, error_policy_pod, ctx.clone())
+        .for_each(|res| async move {
             if let Err(e) = res {
                 tracing::error!(error = %e, "pod reconciliation failed");
             }
-        },
-    );
+        });
     let dep_fut = deployment_controller(deployments)
         .run(reconcile_deployment, error_policy_deployment, ctx.clone())
         .for_each(|res| async move {
