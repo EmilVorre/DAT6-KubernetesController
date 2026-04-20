@@ -42,8 +42,15 @@ async fn main() -> Result<(), kube::Error> {
             .as_deref()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        p.drain_verification = std::env::var("DAT6_DRAIN_VERIFICATION")
+            .as_deref()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         if p.early_readiness_removal {
             info!("S1 — Early Readiness Removal enabled");
+        }
+        if p.drain_verification {
+            info!("S2 — Active Drain Verification enabled");
         }
         p
     };

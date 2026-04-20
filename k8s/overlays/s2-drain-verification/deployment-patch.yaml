@@ -1,0 +1,11 @@
+# S2 — Active Drain Verification (builds on S1 readiness gate setup).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drainable-service
+spec:
+  template:
+    spec:
+      terminationGracePeriodSeconds: 30
+      readinessGates:
+        - conditionType: decomposition.dat6.io/drain

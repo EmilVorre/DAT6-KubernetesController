@@ -1,12 +1,12 @@
 //! Drainable HTTP service — baseline for safe decomposition experiments.
 //!
 //! - GET / — returns 200 with configurable latency (SLEEP_MS env)
-//! - SIGTERM handler: stop accepting new requests, finish in-flight, exit
 //! - GET /metrics — Prometheus metrics (in-flight, total requests, errors)
 //! - GET /healthz — always OK while running
-//! - GET /readyz — fails when draining (on SIGTERM)
+//! - GET /readyz — always OK (controller owns readiness removal)
+//! - GET /drainez — reports active connections and deletion readiness
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::{
@@ -17,7 +17,6 @@ use axum::{
     Json, Router,
 };
 use prometheus::{Encoder, IntCounterVec, IntGauge, Opts, TextEncoder};
-use tokio::sync::broadcast;
 use tower::ServiceBuilder;
 use tower_http::timeout::TimeoutLayer;
 use tracing::info;
@@ -25,8 +24,6 @@ use tracing::info;
 /// Shared app state
 #[derive(Clone)]
 struct AppState {
-    /// True when SIGTERM received — stop accepting, readyz fails
-    draining: broadcast::Sender<()>,
     /// In-flight request count
     in_flight: IntGauge,
     /// Total requests
@@ -37,8 +34,6 @@ struct AppState {
     sleep_ms: u64,
 }
 
-/// Drain signal — when received, we're shutting down
-static DRAINING: AtomicBool = AtomicBool::new(false);
 static IN_FLIGHT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::main]
@@ -63,8 +58,6 @@ async fn main() {
 
     // Burst mode: simulate RPS spikes via env (used by load generator; service just logs)
     let _burst_mode = std::env::var("BURST_MODE").is_ok();
-
-    let (drain_tx, _) = broadcast::channel::<()>(1);
 
     // Prometheus metrics (register to default registry)
     let in_flight = IntGauge::with_opts(Opts::new(
@@ -95,7 +88,6 @@ async fn main() {
         .unwrap();
 
     let state = AppState {
-        draining: drain_tx.clone(),
         in_flight,
         total_requests,
         errors,
@@ -106,6 +98,7 @@ async fn main() {
         .route("/", get(root_handler))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/drainez", get(drainez))
         .route("/metrics", get(metrics_handler))
         .layer(ServiceBuilder::new().layer(TimeoutLayer::new(Duration::from_secs(30))))
         .with_state(state);
@@ -113,55 +106,22 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     info!("drainable-service listening on 0.0.0.0:8080 (SLEEP_MS={}, LONG_REQUESTS_PCT={})", sleep_ms, long_requests_pct);
 
-    // SIGTERM/SIGINT handler — set DRAINING, then signal when safe to exit
-    let drain_tx_clone = drain_tx.clone();
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM");
-            tokio::select! {
-                _ = sigterm.recv() => info!("SIGTERM received, starting drain"),
-                _ = tokio::signal::ctrl_c() => info!("SIGINT received, starting drain"),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::signal::ctrl_c().await.expect("failed to listen for signal");
-            info!("SIGINT received, starting drain");
-        }
-        DRAINING.store(true, Ordering::SeqCst);
-        let _ = drain_tx_clone.send(());
-    });
-
-    // Graceful shutdown: wait for drain signal, then for in-flight requests to complete
-    let mut drain_rx = drain_tx.subscribe();
-    let shutdown = async move {
-        let _ = drain_rx.recv().await;
-        while IN_FLIGHT_COUNT.load(Ordering::SeqCst) > 0 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        info!("drain complete, exiting");
-    };
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
 async fn root_handler(State(state): State<AppState>) -> impl IntoResponse {
-    if DRAINING.load(Ordering::SeqCst) {
-        state.errors.with_label_values(&["/"]).inc();
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "draining"})),
-        )
-            .into_response();
+    struct InFlightGuard<'a> {
+        state: &'a AppState,
     }
-
+    impl Drop for InFlightGuard<'_> {
+        fn drop(&mut self) {
+            IN_FLIGHT_COUNT.fetch_sub(1, Ordering::SeqCst);
+            self.state.in_flight.dec();
+        }
+    }
     IN_FLIGHT_COUNT.fetch_add(1, Ordering::SeqCst);
     state.in_flight.inc();
+    let _guard = InFlightGuard { state: &state };
 
     let sleep_duration = if state.sleep_ms > 0 {
         Duration::from_millis(state.sleep_ms)
@@ -183,8 +143,6 @@ async fn root_handler(State(state): State<AppState>) -> impl IntoResponse {
         tokio::time::sleep(sleep_duration).await;
     }
 
-    IN_FLIGHT_COUNT.fetch_sub(1, Ordering::SeqCst);
-    state.in_flight.dec();
     state
         .total_requests
         .with_label_values(&["/", "200"])
@@ -198,10 +156,20 @@ async fn healthz() -> impl IntoResponse {
 }
 
 async fn readyz(State(_state): State<AppState>) -> impl IntoResponse {
-    if DRAINING.load(Ordering::SeqCst) {
-        return (StatusCode::SERVICE_UNAVAILABLE, "draining").into_response();
-    }
     (StatusCode::OK, "ok").into_response()
+}
+
+async fn drainez() -> impl IntoResponse {
+    let active_connections = IN_FLIGHT_COUNT.load(Ordering::SeqCst);
+    let ready_to_delete = active_connections == 0;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "active_connections": active_connections,
+            "draining": true,
+            "ready_to_delete": ready_to_delete
+        })),
+    )
 }
 
 async fn metrics_handler() -> impl IntoResponse {

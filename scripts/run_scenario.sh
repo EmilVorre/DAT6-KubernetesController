@@ -3,7 +3,7 @@
 #
 # Usage: ./run_scenario.sh SCENARIO STRAT OUTPUT_DIR
 #   SCENARIO: steady_scale_down | rollout | delete_pod
-#   STRAT: baseline | long-requests | burst | baseline-prestop-bad
+#   STRAT: baseline | s1-early-readiness | s2-drain-verification | long-requests | burst | baseline-prestop-bad
 #   OUTPUT_DIR: e.g. runs/20240216-120000-steady_scale_down-baseline
 #
 # Requires: kubectl, k6, kind cluster with drainable-service image loaded

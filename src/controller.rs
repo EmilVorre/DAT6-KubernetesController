@@ -12,10 +12,12 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::{Api, Client, ResourceExt};
+use reqwest::Client as HttpClient;
+use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, instrument, warn};
 
-use crate::decommission::DecommissionState;
+use crate::decommission::{transition, DecommissionEvent, DecommissionState};
 use crate::error::{Error, Result};
 use crate::policy::{
     DecommissionPolicy, PolicyDecision, PolicyEngine, READINESS_GATE_CONDITION_TYPE,
@@ -65,7 +67,7 @@ pub async fn reconcile_pod(obj: Arc<Pod>, ctx: Arc<ControllerContext>) -> Result
     }
 
     let name = obj.name_any();
-    let _ns = obj.namespace().unwrap_or_default();
+    let ns = obj.namespace().unwrap_or_default();
     let phase = obj
         .status
         .as_ref()
@@ -90,9 +92,35 @@ pub async fn reconcile_pod(obj: Arc<Pod>, ctx: Arc<ControllerContext>) -> Result
     );
 
     // Current FSM state (in real impl: read from pod annotation or in-memory store).
-    let fsm_state = read_fsm_state_from_pod(&obj);
+    let mut fsm_state = read_fsm_state_from_pod(&obj);
+    if is_terminating && fsm_state == DecommissionState::Unknown {
+        fsm_state = transition(fsm_state, DecommissionEvent::PodTerminating);
+        persist_fsm_state(&ctx.client, &ns, &name, fsm_state).await?;
+    }
 
     let decision = PolicyEngine::evaluate(&ctx.policy, &name, is_terminating, is_ready, &fsm_state);
+
+    // Keep pods schedulable/ready by default when S1/S2 readiness gates are present.
+    // Readiness gates default to False unless explicitly set in pod status.
+    if has_readiness_gate(&obj, READINESS_GATE_CONDITION_TYPE)
+        && !is_terminating
+        && !readiness_gate_is_true(&obj, READINESS_GATE_CONDITION_TYPE)
+    {
+        let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
+        if let Err(e) = patch_pod_readiness_gate_status(
+            &pods,
+            &name,
+            &obj,
+            "True",
+            "ReadyForService",
+            "controller marks readiness gate true while pod is active",
+        )
+        .await
+        {
+            warn!(pod = %name, error = %e, "failed to set readiness gate True");
+            return Ok(Action::requeue(Duration::from_secs(2)));
+        }
+    }
 
     match decision {
         PolicyDecision::NoAction => {}
@@ -101,13 +129,33 @@ pub async fn reconcile_pod(obj: Arc<Pod>, ctx: Arc<ControllerContext>) -> Result
             if has_readiness_gate(&obj, READINESS_GATE_CONDITION_TYPE) {
                 let ns = obj.namespace().unwrap_or_default();
                 let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
-                if let Err(e) = patch_pod_readiness_gate_false(&pods, &name, &obj).await {
+                if let Err(e) = patch_pod_readiness_gate_status(
+                    &pods,
+                    &name,
+                    &obj,
+                    "False",
+                    "EarlyReadinessRemoval",
+                    "S1: removed from Service endpoints before drain",
+                )
+                .await
+                {
                     warn!(pod = %name, error = %e, "failed to patch pod readiness gate");
                     return Ok(Action::requeue(Duration::from_secs(2)));
                 }
                 info!(pod = %name, "set readiness gate to False (S1 early removal)");
             }
             return Ok(Action::requeue(Duration::from_secs(requeue_after_secs)));
+        }
+        PolicyDecision::WaitForDrainVerification => {
+            let drained = poll_pod_drainez(&obj).await;
+            if drained {
+                let next_state = transition(fsm_state, DecommissionEvent::DrainVerified);
+                persist_fsm_state(&ctx.client, &ns, &name, next_state).await?;
+                remove_pod_finalizer(&ctx.client, &ns, &name).await?;
+                info!(pod = %name, "drain verified; deletion allowed");
+                return Ok(Action::requeue(Duration::from_secs(1)));
+            }
+            return Ok(Action::requeue(Duration::from_millis(500)));
         }
         PolicyDecision::DelayDeletion {
             requeue_after_secs, ..
@@ -119,7 +167,7 @@ pub async fn reconcile_pod(obj: Arc<Pod>, ctx: Arc<ControllerContext>) -> Result
             return Ok(Action::requeue(Duration::from_secs(requeue_after_secs)));
         }
         PolicyDecision::AllowDeletion => {
-            // TODO: remove our finalizer if we added one
+            remove_pod_finalizer(&ctx.client, &ns, &name).await?;
         }
         PolicyDecision::WaitForStateHandover { requeue_after_secs } => {
             return Ok(Action::requeue(Duration::from_secs(requeue_after_secs)));
@@ -148,6 +196,77 @@ fn read_fsm_state_from_pod(pod: &Pod) -> DecommissionState {
     }
 }
 
+async fn persist_fsm_state(client: &Client, namespace: &str, pod_name: &str, state: DecommissionState) -> Result<()> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let patch = json!({
+        "metadata": {
+            "annotations": {
+                "decomposition.dat6.io/state": crate::decommission::state_to_annotation_value(state),
+            }
+        }
+    });
+    let params = PatchParams::default();
+    pods.patch(pod_name, &params, &Patch::Merge(&patch))
+        .await
+        .map_err(Error::from)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct DrainezResponse {
+    ready_to_delete: bool,
+}
+
+async fn poll_pod_drainez(pod: &Pod) -> bool {
+    let Some(ip) = pod.status.as_ref().and_then(|s| s.pod_ip.as_ref()).cloned() else {
+        // If pod IP already gone, treat as drained so we don't deadlock deletion.
+        return true;
+    };
+    let http = HttpClient::new();
+    let url = format!("http://{ip}:8080/drainez");
+    for _ in 0..5 {
+        let res = http
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await;
+        match res {
+            Ok(resp) => {
+                if let Ok(payload) = resp.json::<DrainezResponse>().await {
+                    if payload.ready_to_delete {
+                        return true;
+                    }
+                }
+            }
+            Err(_) => {
+                // Pod unreachable -> allow deletion to avoid deadlock.
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // Repeated failures should not block forever.
+    true
+}
+
+async fn remove_pod_finalizer(client: &Client, namespace: &str, pod_name: &str) -> Result<()> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let pod = pods.get(pod_name).await.map_err(Error::from)?;
+    let remaining: Vec<String> = pod
+        .metadata
+        .finalizers
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| f != "decomposition.dat6.io/finalizer")
+        .collect();
+    let patch = json!({ "metadata": { "finalizers": remaining } });
+    let params = PatchParams::default();
+    pods.patch(pod_name, &params, &Patch::Merge(&patch))
+        .await
+        .map_err(Error::from)?;
+    Ok(())
+}
+
 /// True if the pod spec has a readinessGate for our condition type (S1).
 fn has_readiness_gate(pod: &Pod, condition_type: &str) -> bool {
     pod.spec
@@ -157,8 +276,27 @@ fn has_readiness_gate(pod: &Pod, condition_type: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Patch pod status to set our readiness gate condition to False (S1 — early readiness removal).
-async fn patch_pod_readiness_gate_false(pods: &Api<Pod>, name: &str, pod: &Pod) -> Result<()> {
+fn readiness_gate_is_true(pod: &Pod, condition_type: &str) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .map(|conditions| {
+            conditions
+                .iter()
+                .any(|cond| cond.type_ == condition_type && cond.status == "True")
+        })
+        .unwrap_or(false)
+}
+
+/// Patch pod status to set our readiness gate condition status.
+async fn patch_pod_readiness_gate_status(
+    pods: &Api<Pod>,
+    name: &str,
+    pod: &Pod,
+    status: &str,
+    reason: &str,
+    message: &str,
+) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut conditions: Vec<serde_json::Value> = pod
         .status
@@ -182,10 +320,10 @@ async fn patch_pod_readiness_gate_false(pods: &Api<Pod>, name: &str, pod: &Pod) 
         .unwrap_or_default();
     conditions.push(json!({
         "type": READINESS_GATE_CONDITION_TYPE,
-        "status": "False",
+        "status": status,
         "lastTransitionTime": now,
-        "reason": "EarlyReadinessRemoval",
-        "message": "S1: removed from Service endpoints before drain",
+        "reason": reason,
+        "message": message,
     }));
     let patch = json!({ "status": { "conditions": conditions } });
     let params = PatchParams::default();

@@ -34,6 +34,7 @@ pub enum DecommissionEvent {
     PreStopFinished,
     StateHandoverComplete,
     DeletionAllowed,
+    DrainVerified,
 }
 
 /// Decommission FSM: given current state and event, returns next state (and optional side effect).
@@ -43,6 +44,7 @@ pub fn transition(current: DecommissionState, event: DecommissionEvent) -> Decom
 
     match (current, event) {
         (S::Unknown, E::PodTerminating) => S::Draining,
+        (S::Draining, E::DrainVerified) => S::DeletionAllowed,
         (S::Draining, E::ReadinessLost) => S::ReadinessLost,
         (S::Draining, E::EndpointsRemoved) => S::ReadinessLost,
         (S::ReadinessLost, E::PreStopStarted) => S::PreStopRunning,

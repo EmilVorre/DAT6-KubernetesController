@@ -73,6 +73,15 @@ When a pod is terminating, the controller can set a custom readiness gate to **F
 2. Run the controller with S1 enabled: `DAT6_EARLY_READINESS_REMOVAL=1 cargo run`
 3. Run scenarios: `make run SCENARIO=rollout STRAT=s1-early-readiness`
 
+## S2 — Active Drain Verification
+
+S2 extends S1 by polling each terminating pod at `GET /drainez` and only allowing deletion when
+the app reports `ready_to_delete=true` (or if the pod is already unreachable).
+
+1. Deploy the S2 overlay: `make deploy-baseline K8S_OVERLAY=s2-drain-verification`
+2. Run the controller with S2 enabled: `DAT6_EARLY_READINESS_REMOVAL=1 DAT6_DRAIN_VERIFICATION=1 cargo run`
+3. Run scenarios: `make run SCENARIO=rollout STRAT=s2-drain-verification`
+
 ## N repeats and stable metrics
 
 Run a scenario N times and get aggregated metrics (e.g. mean/min/max loss and latency):
@@ -80,9 +89,16 @@ Run a scenario N times and get aggregated metrics (e.g. mean/min/max loss and la
 ```bash
 make run-repeats N=5 SCENARIO=steady_scale_down STRAT=baseline
 make run-repeats N=5 SCENARIO=rollout STRAT=s1-early-readiness
+make run-repeats N=5 SCENARIO=rollout STRAT=s2-drain-verification
 ```
 
 Output: `runs/<timestamp>-<scenario>-<strat>-repeats/` with `run_1/` … `run_N/`, `summary_repeats.csv`, and `aggregate.json`.
+
+To run a full comparison matrix (baseline + S1 + S2 across rollout + steady_scale_down):
+
+```bash
+make run-all N=5
+```
 
 ### Why run_2+ can show 0% loss (steady_scale_down)
 

@@ -29,7 +29,11 @@ mkdir -p "$OUTPUT_PARENT"
 
 for i in $(seq 1 "$N"); do
   echo "--- Repeat $i / $N ---"
-  bash "$SCRIPT_DIR/scripts/run_scenario.sh" "$SCENARIO" "$STRAT" "$OUTPUT_PARENT/run_$i"
+  RUN_PATH="$OUTPUT_PARENT/run_$i"
+  bash "$SCRIPT_DIR/scripts/run_scenario.sh" "$SCENARIO" "$STRAT" "$RUN_PATH"
+  if command -v python3 &>/dev/null; then
+    python3 "$SCRIPT_DIR/scripts/plot_timeline.py" "$RUN_PATH" 2>/dev/null || true
+  fi
 done
 
 # Aggregate: summary_repeats.csv + aggregate.json

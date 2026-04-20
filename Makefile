@@ -12,9 +12,9 @@ TIMESTAMP ?= $(shell date +%Y%m%d-%H%M%S)
 APP_IMAGE ?= drainable-service:latest
 APP_NAMESPACE ?= default
 
-.PHONY: cluster-up cluster-down cluster-status
+.PHONY: cluster-up cluster-down cluster-status cluster-reset
 .PHONY: deploy-baseline deploy-prometheus deploy-kube-state-metrics
-.PHONY: build-app load-app run run-repeats clean help
+.PHONY: build-app load-app run run-repeats run-all run-all-auto clean help
 
 # --- Cluster lifecycle ---
 cluster-up:
@@ -23,6 +23,10 @@ cluster-up:
 
 cluster-down:
 	kind delete cluster --name $(CLUSTER_NAME)
+
+cluster-reset:
+	kind delete cluster --name $(CLUSTER_NAME) || true
+	$(MAKE) cluster-up
 
 cluster-status:
 	kubectl cluster-info --context kind-$(CLUSTER_NAME)
@@ -65,6 +69,39 @@ N ?= 5
 run-repeats:
 	bash scripts/run_repeats.sh $(N) $(SCENARIO) $(STRAT)
 
+run-all:
+	@set -euo pipefail; \
+	N_RUNS="$(N)"; \
+	STAMP="$${TIMESTAMP:-$$(date +%Y%m%d-%H%M%S)}"; \
+	COMPARE_DIR="$(RUN_DIR)/compare-$$STAMP"; \
+	STRATS="baseline s1-early-readiness s2-drain-verification"; \
+	SCENARIOS="rollout steady_scale_down"; \
+	mkdir -p "$$COMPARE_DIR"; \
+	for strat in $$STRATS; do \
+	  for scenario in $$SCENARIOS; do \
+	    echo "=== $$strat / $$scenario ==="; \
+	    $(MAKE) cluster-reset; \
+	    $(MAKE) deploy-baseline K8S_OVERLAY=$$strat; \
+	    if [ "$$strat" = "baseline" ]; then \
+	      echo "Run controller without strategy flags for baseline."; \
+	    elif [ "$$strat" = "s1-early-readiness" ]; then \
+	      echo "Run controller with DAT6_EARLY_READINESS_REMOVAL=1."; \
+	    else \
+	      echo "Run controller with DAT6_EARLY_READINESS_REMOVAL=1 DAT6_DRAIN_VERIFICATION=1."; \
+	    fi; \
+	    run_ts="$$(date +%Y%m%d-%H%M%S)"; \
+	    TIMESTAMP="$$run_ts" RUN_DIR="$(RUN_DIR)" $(MAKE) run-repeats N="$$N_RUNS" SCENARIO="$$scenario" STRAT="$$strat"; \
+	    src_dir="$(RUN_DIR)/$$run_ts-$$scenario-$$strat-repeats"; \
+	    dst_dir="$$COMPARE_DIR/$$strat-$$scenario"; \
+	    rm -rf "$$dst_dir"; \
+	    cp -a "$$src_dir" "$$dst_dir"; \
+	  done; \
+	done; \
+	python3 scripts/compare.py "$$COMPARE_DIR"
+
+run-all-auto:
+	bash scripts/run_all_auto.sh $(N)
+
 # --- Full setup (cluster + prometheus + baseline) ---
 setup: cluster-up
 	@echo "Waiting for cluster to be ready..."
@@ -95,10 +132,14 @@ help:
 	@echo "  make run SCENARIO=steady_scale_down STRAT=baseline"
 	@echo "  make run SCENARIO=steady_scale_down STRAT=long-requests"
 	@echo "  make run SCENARIO=rollout STRAT=s1-early-readiness"
+	@echo "  make run SCENARIO=rollout STRAT=s2-drain-verification"
 	@echo ""
 	@echo "Run N repeats (stable metrics):"
 	@echo "  make run-repeats N=5 SCENARIO=steady_scale_down STRAT=baseline"
 	@echo "  make run-repeats N=5 SCENARIO=rollout STRAT=s1-early-readiness"
+	@echo "  make run-repeats N=5 SCENARIO=rollout STRAT=s2-drain-verification"
+	@echo "  make run-all N=5"
+	@echo "  make run-all-auto N=5"
 	@echo ""
 	@echo "Full setup:"
 	@echo "  make setup               cluster-up + prometheus + baseline"

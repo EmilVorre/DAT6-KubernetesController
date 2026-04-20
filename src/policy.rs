@@ -21,6 +21,8 @@ pub struct DecommissionPolicy {
     /// to False so the pod is removed from Service endpoints immediately (stops new traffic),
     /// then allow in-flight requests to drain.
     pub early_readiness_removal: bool,
+    /// **S2 — Active Drain Verification:** poll pod /drainez before allowing deletion.
+    pub drain_verification: bool,
     /// Optional: validate state handover (e.g. migration, backup) before deletion.
     pub state_handover: Option<StateHandoverConfig>,
 }
@@ -80,6 +82,8 @@ pub enum PolicyDecision {
     AllowDeletion,
     /// Wait for state handover (annotation / external signal).
     WaitForStateHandover { requeue_after_secs: u64 },
+    /// **S2:** Poll pod /drainez and wait until ready_to_delete=true.
+    WaitForDrainVerification,
 }
 
 /// Policy engine: given current pod/workload state and policy, returns the next decision.
@@ -99,13 +103,19 @@ impl PolicyEngine {
         _pod_name: &str,
         is_terminating: bool,
         is_ready: bool,
-        _fsm_state: &crate::decommission::DecommissionState,
+        fsm_state: &crate::decommission::DecommissionState,
     ) -> PolicyDecision {
         // S1: as soon as pod is terminating, remove it from readiness so it stops receiving traffic
         if policy.early_readiness_removal && is_terminating && is_ready {
             return PolicyDecision::EnsureReadinessRemoved {
                 requeue_after_secs: 1,
             };
+        }
+        if policy.drain_verification
+            && is_terminating
+            && *fsm_state == crate::decommission::DecommissionState::Draining
+        {
+            return PolicyDecision::WaitForDrainVerification;
         }
         // TODO: full policy evaluation (DelayDeletion, EnsurePreStop, AllowDeletion, etc.)
         PolicyDecision::NoAction
