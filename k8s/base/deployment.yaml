@@ -22,8 +22,8 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: drainable-service
-          image: drainable-service:latest
-          imagePullPolicy: IfNotPresent
+          image: ghcr.io/emilvorre/drainable-service:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
               name: http
