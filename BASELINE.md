@@ -26,9 +26,10 @@ make run SCENARIO=steady_scale_down STRAT=baseline
 
 - **GET /** — 200, configurable latency (`SLEEP_MS`), fault injection (`LONG_REQUESTS_PCT`)
 - **GET /healthz** — always OK while running
-- **GET /readyz** — fails when draining (SIGTERM received)
+- **GET /readyz** — **always 200 by design** (readiness during decomposition is owned by the controller's gate, not the app)
+- **GET /drainez** — `active_connections`, `draining` (true after SIGTERM), `ready_to_delete` (drain complete)
 - **GET /metrics** — Prometheus metrics (in-flight, total requests, errors)
-- **SIGTERM** — stop accepting, finish in-flight, exit
+- **SIGTERM** — opt-in via `DAT6_GRACEFUL_DRAIN=1`. When enabled, sets `draining=true`, keeps serving in-flight requests until they complete (or `DAT6_DRAIN_MAX_SECS` elapses), then exits. When disabled (the baseline configuration), the process inherits the kernel default and exits immediately.
 
 ## Overlays
 

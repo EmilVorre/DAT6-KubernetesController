@@ -28,8 +28,15 @@ spec:
             - containerPort: 8080
               name: http
           env:
+            # `SLEEP_MS` is the per-request server-side latency in milliseconds.
+            # Overlays set this to a value that is large enough that requests
+            # are *catchable* in flight during a rollout (typically 500ms);
+            # the base ships a 250ms default so the workload still has
+            # measurable in-flight requests if someone applies the base
+            # directly. SLEEP_MS=0 makes requests sub-millisecond which makes
+            # it effectively impossible to observe drop behavior.
             - name: SLEEP_MS
-              value: "0"
+              value: "250"
           resources:
             requests:
               cpu: 50m

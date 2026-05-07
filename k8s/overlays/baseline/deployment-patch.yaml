@@ -1,3 +1,8 @@
+# Baseline — no graceful shutdown, no controller strategy.
+#
+# Deliberately omits `DAT6_GRACEFUL_DRAIN`: the process inherits the kernel
+# default for SIGTERM and dies immediately, dropping in-flight requests. This
+# is what we want to measure against for S1/S2.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -11,4 +16,4 @@ spec:
           env:
             - name: SLEEP_MS
               value: "500"
-      # No preStop — baseline for comparison
+      # No preStop — baseline for comparison.

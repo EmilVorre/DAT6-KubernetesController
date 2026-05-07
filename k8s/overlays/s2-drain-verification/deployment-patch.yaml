@@ -1,4 +1,20 @@
-# S2 — Active Drain Verification (builds on S1 readiness gate setup).
+# S2 — Active Drain Verification (builds on S1 readiness-gate setup).
+#
+# Requires the controller to be running with both:
+#   DAT6_EARLY_READINESS_REMOVAL=1
+#   DAT6_DRAIN_VERIFICATION=1
+#
+# The controller adds the `decomposition.dat6.io/finalizer` to running pods so
+# that pod resource deletion is held until `/drainez` reports
+# `ready_to_delete: true`. The finalizer must be added *before* the pod
+# starts terminating; if the controller is not running when pods are created
+# it will best-effort patch the finalizer when termination is observed, but
+# that path is racy and not recommended.
+#
+# `DAT6_GRACEFUL_DRAIN=1` is required: the controller's `/drainez` poll only
+# works while the app is still alive. Without graceful drain the process
+# would exit on SIGTERM before any poll could succeed, and S2's deletion
+# gating would degrade to a no-op fallback.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -12,5 +28,9 @@ spec:
           env:
             - name: SLEEP_MS
               value: "500"
+            - name: DAT6_GRACEFUL_DRAIN
+              value: "1"
+            - name: DAT6_DRAIN_MAX_SECS
+              value: "28"
       readinessGates:
         - conditionType: decomposition.dat6.io/drain

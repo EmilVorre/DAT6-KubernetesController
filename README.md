@@ -75,8 +75,30 @@ When a pod is terminating, the controller can set a custom readiness gate to **F
 
 ## S2 — Active Drain Verification
 
-S2 extends S1 by polling each terminating pod at `GET /drainez` and only allowing deletion when
-the app reports `ready_to_delete=true` (or if the pod is already unreachable).
+S2 extends S1 by:
+
+1. Patching a `decomposition.dat6.io/finalizer` onto every active pod so
+   Kubernetes cannot remove the pod resource until the controller releases
+   it.
+2. Polling `GET /drainez` on each terminating pod; only when the app reports
+   `ready_to_delete: true` does the controller remove the finalizer.
+3. Falling back to forced finalizer removal if the pod has been terminating
+   for longer than its `terminationGracePeriodSeconds` and is unreachable
+   (kubelet has SIGKILL'd it). Without this fallback a dead pod would deadlock
+   deletion.
+
+**The controller must be running before pods are created** — the finalizer is
+added when the pod is observed in the `Running` phase. If the controller
+starts after pods exist, an in-flight pod that begins terminating before its
+next reconcile will not get the finalizer and S2 will degrade to S1 for that
+pod. `scripts/run_all_auto.sh` already orders things correctly (controller
+first, then `kubectl apply`).
+
+The S1/S2 overlays also set `DAT6_GRACEFUL_DRAIN=1` on the app container so
+that the process keeps serving in-flight requests on SIGTERM (instead of
+exiting immediately like the baseline does); without this, `/drainez` is
+unreachable as soon as kubelet sends SIGTERM and S2's polling collapses to
+the unreachable-fallback path.
 
 1. Deploy the S2 overlay: `make deploy-baseline K8S_OVERLAY=s2-drain-verification`
 2. Run the controller with S2 enabled: `DAT6_EARLY_READINESS_REMOVAL=1 DAT6_DRAIN_VERIFICATION=1 cargo run`

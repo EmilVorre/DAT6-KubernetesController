@@ -1,6 +1,11 @@
 # S1 — Early Readiness Removal
 # Adds a custom readiness gate so the controller can set it to False when the pod
-# is terminating, removing the pod from Service endpoints before preStop/grace period.
+# is terminating, removing the pod from Service endpoints before preStop/grace.
+#
+# `DAT6_GRACEFUL_DRAIN=1` makes the app keep serving in-flight requests on
+# SIGTERM (instead of dying immediately, like the baseline does). Without this
+# the early-readiness-removal strategy only protects *new* requests; in-flight
+# ones would still be lost when the kubelet kills the container.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,7 +19,11 @@ spec:
           env:
             - name: SLEEP_MS
               value: "500"
-      # Custom readiness gate: controller sets this to False on termination (S1).
+            - name: DAT6_GRACEFUL_DRAIN
+              value: "1"
+            - name: DAT6_DRAIN_MAX_SECS
+              value: "28"
       readinessGates:
         - conditionType: decomposition.dat6.io/drain
-      # No preStop — S1 removes traffic via readiness; optional preStop can be added per overlay
+      # No preStop — S1 removes traffic via readiness gate; the app handles
+      # SIGTERM-driven graceful drain itself.

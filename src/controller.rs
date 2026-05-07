@@ -26,6 +26,10 @@ use crate::policy::{
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
 
+/// Finalizer key the controller adds to S2-managed pods so that pod resource
+/// deletion is held until the controller has verified `/drainez`.
+pub const POD_FINALIZER: &str = "decomposition.dat6.io/finalizer";
+
 /// Shared context for all reconcilers (client, policy, optional metrics).
 #[derive(Clone)]
 pub struct ControllerContext {
@@ -83,29 +87,75 @@ pub async fn reconcile_pod(obj: Arc<Pod>, ctx: Arc<ControllerContext>) -> Result
                 .any(|cond| cond.type_ == "Ready" && cond.status == "True")
         })
         .unwrap_or(false);
+    let has_gate = has_readiness_gate(&obj, READINESS_GATE_CONDITION_TYPE);
+    let gate_is_true_now = readiness_gate_is_true(&obj, READINESS_GATE_CONDITION_TYPE);
 
     info!(
         phase = %phase,
         is_terminating = is_terminating,
         is_ready = is_ready,
+        has_gate = has_gate,
+        gate_is_true = gate_is_true_now,
         "reconciling pod"
     );
+
+    // S2 — Active Drain Verification: the controller must hold the pod resource
+    // via a finalizer until `/drainez` reports `ready_to_delete`. The finalizer
+    // *must* be added before the pod begins terminating; if we wait until we see
+    // `deletionTimestamp`, the kubelet may already have started the termination
+    // sequence and the pod may be removed before we can react. Add it as soon as
+    // the pod is Running.
+    if ctx.policy.drain_verification
+        && !is_terminating
+        && phase == "Running"
+        && !has_pod_finalizer(&obj, POD_FINALIZER)
+    {
+        if let Err(e) = add_pod_finalizer(&ctx.client, &ns, &name, &obj).await {
+            warn!(pod = %name, error = %e, "failed to add S2 finalizer; will retry");
+            return Ok(Action::requeue(Duration::from_secs(2)));
+        }
+        info!(pod = %name, finalizer = %POD_FINALIZER, "added S2 finalizer");
+        // requeue quickly so we observe the patched object next iteration
+        return Ok(Action::requeue(Duration::from_secs(1)));
+    }
 
     // Current FSM state (in real impl: read from pod annotation or in-memory store).
     let mut fsm_state = read_fsm_state_from_pod(&obj);
     if is_terminating && fsm_state == DecommissionState::Unknown {
         fsm_state = transition(fsm_state, DecommissionEvent::PodTerminating);
         persist_fsm_state(&ctx.client, &ns, &name, fsm_state).await?;
+
+        // Best-effort fallback: if we somehow missed the Running window (e.g.
+        // controller started after the pod was created), still try to add the
+        // finalizer here. This is racy — Kubernetes may have already started
+        // tearing the pod down — but it's strictly better than no-op.
+        if ctx.policy.drain_verification && !has_pod_finalizer(&obj, POD_FINALIZER) {
+            match add_pod_finalizer(&ctx.client, &ns, &name, &obj).await {
+                Ok(_) => info!(
+                    pod = %name,
+                    "added S2 finalizer late (pod was already terminating)"
+                ),
+                Err(e) => warn!(
+                    pod = %name,
+                    error = %e,
+                    "failed to add S2 finalizer late; deletion will not be gated"
+                ),
+            }
+        }
     }
 
-    let decision = PolicyEngine::evaluate(&ctx.policy, &name, is_terminating, is_ready, &fsm_state);
+    let decision = PolicyEngine::evaluate(
+        &ctx.policy,
+        &name,
+        is_terminating,
+        has_gate,
+        gate_is_true_now,
+        &fsm_state,
+    );
 
     // Keep pods schedulable/ready by default when S1/S2 readiness gates are present.
     // Readiness gates default to False unless explicitly set in pod status.
-    if has_readiness_gate(&obj, READINESS_GATE_CONDITION_TYPE)
-        && !is_terminating
-        && !readiness_gate_is_true(&obj, READINESS_GATE_CONDITION_TYPE)
-    {
+    if has_gate && !is_terminating && !gate_is_true_now {
         let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
         if let Err(e) = patch_pod_readiness_gate_status(
             &pods,
@@ -125,37 +175,79 @@ pub async fn reconcile_pod(obj: Arc<Pod>, ctx: Arc<ControllerContext>) -> Result
     match decision {
         PolicyDecision::NoAction => {}
         PolicyDecision::EnsureReadinessRemoved { requeue_after_secs } => {
-            // S1 — Early Readiness Removal: patch pod status so our readiness gate is False.
-            if has_readiness_gate(&obj, READINESS_GATE_CONDITION_TYPE) {
-                let ns = obj.namespace().unwrap_or_default();
-                let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
-                if let Err(e) = patch_pod_readiness_gate_status(
-                    &pods,
-                    &name,
-                    &obj,
-                    "False",
-                    "EarlyReadinessRemoval",
-                    "S1: removed from Service endpoints before drain",
-                )
-                .await
-                {
-                    warn!(pod = %name, error = %e, "failed to patch pod readiness gate");
-                    return Ok(Action::requeue(Duration::from_secs(2)));
-                }
-                info!(pod = %name, "set readiness gate to False (S1 early removal)");
+            // The policy only returns this decision when `has_gate && gate_is_true`,
+            // so the patch is always applicable here.
+            let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
+            if let Err(e) = patch_pod_readiness_gate_status(
+                &pods,
+                &name,
+                &obj,
+                "False",
+                "EarlyReadinessRemoval",
+                "S1: removed from Service endpoints before drain",
+            )
+            .await
+            {
+                warn!(pod = %name, error = %e, "failed to patch pod readiness gate");
+                return Ok(Action::requeue(Duration::from_secs(2)));
             }
+            info!(pod = %name, "set readiness gate to False (S1 early removal)");
             return Ok(Action::requeue(Duration::from_secs(requeue_after_secs)));
         }
         PolicyDecision::WaitForDrainVerification => {
-            let drained = poll_pod_drainez(&obj).await;
-            if drained {
-                let next_state = transition(fsm_state, DecommissionEvent::DrainVerified);
-                persist_fsm_state(&ctx.client, &ns, &name, next_state).await?;
-                remove_pod_finalizer(&ctx.client, &ns, &name).await?;
-                info!(pod = %name, "drain verified; deletion allowed");
-                return Ok(Action::requeue(Duration::from_secs(1)));
+            let outcome = poll_pod_drainez(&obj).await;
+            // How long has the pod been terminating? Use that to bound the
+            // unreachable-fallback window so a permanently-dead pod doesn't
+            // block deletion forever.
+            let terminating_for = obj
+                .metadata
+                .deletion_timestamp
+                .as_ref()
+                .map(|t| {
+                    chrono::Utc::now()
+                        .signed_duration_since(t.0)
+                        .num_seconds()
+                        .max(0)
+                })
+                .unwrap_or(0);
+            // Pod's grace period (clamped) gives us an upper bound on how long
+            // the container could plausibly still be alive. After that, the
+            // kubelet has SIGKILL'd it; we should release the finalizer.
+            let grace = obj
+                .spec
+                .as_ref()
+                .and_then(|s| s.termination_grace_period_seconds)
+                .unwrap_or(30);
+
+            match outcome {
+                DrainezPollOutcome::ReadyToDelete => {
+                    let next_state = transition(fsm_state, DecommissionEvent::DrainVerified);
+                    persist_fsm_state(&ctx.client, &ns, &name, next_state).await?;
+                    remove_pod_finalizer(&ctx.client, &ns, &name).await?;
+                    info!(pod = %name, "drain verified; deletion allowed");
+                    return Ok(Action::requeue(Duration::from_secs(1)));
+                }
+                DrainezPollOutcome::NotYet => {
+                    return Ok(Action::requeue(Duration::from_millis(500)));
+                }
+                DrainezPollOutcome::Unreachable => {
+                    if terminating_for >= i64::from(grace) {
+                        warn!(
+                            pod = %name,
+                            terminating_for_s = terminating_for,
+                            grace_s = grace,
+                            "pod /drainez unreachable past grace period; removing finalizer to avoid deadlock"
+                        );
+                        let next_state = transition(fsm_state, DecommissionEvent::DrainVerified);
+                        persist_fsm_state(&ctx.client, &ns, &name, next_state).await?;
+                        remove_pod_finalizer(&ctx.client, &ns, &name).await?;
+                        return Ok(Action::requeue(Duration::from_secs(1)));
+                    }
+                    // Pod might just be slow to come up its termination phase
+                    // (or transiently unreachable). Keep waiting.
+                    return Ok(Action::requeue(Duration::from_millis(500)));
+                }
             }
-            return Ok(Action::requeue(Duration::from_millis(500)));
         }
         PolicyDecision::DelayDeletion {
             requeue_after_secs, ..
@@ -217,36 +309,76 @@ struct DrainezResponse {
     ready_to_delete: bool,
 }
 
-async fn poll_pod_drainez(pod: &Pod) -> bool {
+/// Outcome of a single `/drainez` poll. We deliberately distinguish "still
+/// has in-flight work" from "pod is unreachable (likely already dead)" so the
+/// reconcile loop can wait or escalate appropriately. Returning `true` on any
+/// error — as the previous implementation did — masks bugs (the pod can be
+/// SIGKILL'd before we ever observe a successful poll, which makes S2's
+/// deletion-gating effectively a no-op).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainezPollOutcome {
+    /// `/drainez` returned `ready_to_delete: true` — safe to remove finalizer.
+    ReadyToDelete,
+    /// `/drainez` responded but reports active in-flight work.
+    NotYet,
+    /// Pod IP missing or HTTP request failed — pod is most likely already gone.
+    /// The reconcile loop should bound how long it waits for this state before
+    /// giving up and removing the finalizer to avoid a deadlock.
+    Unreachable,
+}
+
+async fn poll_pod_drainez(pod: &Pod) -> DrainezPollOutcome {
     let Some(ip) = pod.status.as_ref().and_then(|s| s.pod_ip.as_ref()).cloned() else {
-        // If pod IP already gone, treat as drained so we don't deadlock deletion.
-        return true;
+        return DrainezPollOutcome::Unreachable;
     };
     let http = HttpClient::new();
     let url = format!("http://{ip}:8080/drainez");
-    for _ in 0..5 {
-        let res = http
-            .get(&url)
-            .timeout(Duration::from_secs(1))
-            .send()
-            .await;
-        match res {
-            Ok(resp) => {
-                if let Ok(payload) = resp.json::<DrainezResponse>().await {
-                    if payload.ready_to_delete {
-                        return true;
-                    }
+    let res = http
+        .get(&url)
+        .timeout(Duration::from_secs(1))
+        .send()
+        .await;
+    match res {
+        Ok(resp) => match resp.json::<DrainezResponse>().await {
+            Ok(payload) => {
+                if payload.ready_to_delete {
+                    DrainezPollOutcome::ReadyToDelete
+                } else {
+                    DrainezPollOutcome::NotYet
                 }
             }
-            Err(_) => {
-                // Pod unreachable -> allow deletion to avoid deadlock.
-                return true;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+            Err(_) => DrainezPollOutcome::NotYet,
+        },
+        Err(_) => DrainezPollOutcome::Unreachable,
     }
-    // Repeated failures should not block forever.
-    true
+}
+
+async fn add_pod_finalizer(
+    client: &Client,
+    namespace: &str,
+    pod_name: &str,
+    pod: &Pod,
+) -> Result<()> {
+    let mut finalizers: Vec<String> = pod.metadata.finalizers.clone().unwrap_or_default();
+    if finalizers.iter().any(|f| f == POD_FINALIZER) {
+        return Ok(());
+    }
+    finalizers.push(POD_FINALIZER.to_string());
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let patch = json!({ "metadata": { "finalizers": finalizers } });
+    let params = PatchParams::default();
+    pods.patch(pod_name, &params, &Patch::Merge(&patch))
+        .await
+        .map_err(Error::from)?;
+    Ok(())
+}
+
+fn has_pod_finalizer(pod: &Pod, key: &str) -> bool {
+    pod.metadata
+        .finalizers
+        .as_ref()
+        .map(|fs| fs.iter().any(|f| f == key))
+        .unwrap_or(false)
 }
 
 async fn remove_pod_finalizer(client: &Client, namespace: &str, pod_name: &str) -> Result<()> {
@@ -257,7 +389,7 @@ async fn remove_pod_finalizer(client: &Client, namespace: &str, pod_name: &str) 
         .finalizers
         .unwrap_or_default()
         .into_iter()
-        .filter(|f| f != "decomposition.dat6.io/finalizer")
+        .filter(|f| f != POD_FINALIZER)
         .collect();
     let patch = json!({ "metadata": { "finalizers": remaining } });
     let params = PatchParams::default();

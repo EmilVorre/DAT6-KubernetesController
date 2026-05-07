@@ -95,29 +95,57 @@ pub const READINESS_GATE_CONDITION_TYPE: &str = "decomposition.dat6.io/drain";
 impl PolicyEngine {
     /// Evaluate what to do for this pod based on policy and current cluster state.
     ///
-    /// **S1 — Early Readiness Removal:** When enabled and pod is terminating but still ready,
-    /// we return EnsureReadinessRemoved so the controller patches our readiness gate to False,
-    /// removing the pod from Service endpoints before preStop/grace period.
+    /// Strategy semantics:
+    ///
+    /// - **S1 — Early Readiness Removal:** terminating pod has its readiness
+    ///   gate flipped to `False` so it leaves Service endpoints before
+    ///   preStop/grace. Once the gate is `False`, no further action.
+    /// - **S2 — Active Drain Verification:** treats S1 as a *prerequisite step*
+    ///   (pull traffic before draining) and then polls `/drainez` until the
+    ///   app reports `ready_to_delete: true` before letting Kubernetes delete
+    ///   the pod.
+    ///
+    /// S2 is a strict superset of S1. The two flags are independent inputs but
+    /// the evaluation here makes the combined behavior explicit so we never
+    /// rely on reconcile-loop fall-through ordering.
+    ///
+    /// `has_readiness_gate` and `gate_is_true` describe the
+    /// `decomposition.dat6.io/drain` readiness gate specifically, *not* the
+    /// pod's overall `Ready` condition. We use the gate state directly because
+    /// on a pod without the gate (e.g. `baseline` overlay applied while the
+    /// controller has S1 enabled) the overall `Ready` is True purely from the
+    /// readiness probe — there is nothing the controller can flip — and using
+    /// the overall condition would loop the FSM forever returning
+    /// `EnsureReadinessRemoved`.
     pub fn evaluate(
         policy: &DecommissionPolicy,
         _pod_name: &str,
         is_terminating: bool,
-        is_ready: bool,
-        fsm_state: &crate::decommission::DecommissionState,
+        has_readiness_gate: bool,
+        gate_is_true: bool,
+        _fsm_state: &crate::decommission::DecommissionState,
     ) -> PolicyDecision {
-        // S1: as soon as pod is terminating, remove it from readiness so it stops receiving traffic
-        if policy.early_readiness_removal && is_terminating && is_ready {
+        if !is_terminating {
+            return PolicyDecision::NoAction;
+        }
+
+        let s1_or_s2 = policy.early_readiness_removal || policy.drain_verification;
+
+        // Step 1 of S1/S2: ensure readiness gate flipped to False (only
+        // possible if the pod actually has the gate in its spec).
+        if s1_or_s2 && has_readiness_gate && gate_is_true {
             return PolicyDecision::EnsureReadinessRemoved {
                 requeue_after_secs: 1,
             };
         }
-        if policy.drain_verification
-            && is_terminating
-            && *fsm_state == crate::decommission::DecommissionState::Draining
-        {
+
+        // Step 2 of S2: poll /drainez until ready_to_delete=true.
+        if policy.drain_verification {
             return PolicyDecision::WaitForDrainVerification;
         }
-        // TODO: full policy evaluation (DelayDeletion, EnsurePreStop, AllowDeletion, etc.)
+
+        // S1 only (or S1 with no gate present) — nothing more to do; let
+        // Kubernetes tear the pod down on its normal grace-period timeline.
         PolicyDecision::NoAction
     }
 }

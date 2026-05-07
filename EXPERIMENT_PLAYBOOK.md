@@ -26,11 +26,21 @@ This file is a practical guide for:
 - Endpoints:
   - `/` (main request path)
   - `/healthz`
-  - `/readyz` (always 200)
-  - `/drainez` (returns active connections + ready_to_delete)
+  - `/readyz` — **always returns 200 by design.** Readiness during
+    decomposition is owned by the controller (via the
+    `decomposition.dat6.io/drain` gate), not the app. This is a deliberate
+    choice so the experiment isolates the controller's contribution; it
+    means kube-proxy will not remove the pod from endpoints when the app is
+    unhealthy. See module docs in `app/src/main.rs` for the trade-off.
+  - `/drainez` — returns `active_connections`, `draining` (true only after
+    SIGTERM has actually been received), and `ready_to_delete` (only true
+    once `draining=true && active_connections=0`).
   - `/metrics`
 - In-flight counter is tracked via atomic and guard.
-- App-level custom graceful shutdown logic has been removed.
+- Graceful drain is **opt-in** via `DAT6_GRACEFUL_DRAIN=1` (set in the
+  `s1-early-readiness` and `s2-drain-verification` overlays). When unset, the
+  process inherits the kernel default for SIGTERM and dies immediately —
+  this is what the `baseline` overlay uses.
 
 ### Test runner behavior
 
@@ -190,6 +200,81 @@ Interpretation pattern:
 - S1/S2 behavior is sensitive to controller timing and rollout order.
 - The controller currently watches broadly; heavy cluster noise can affect responsiveness.
 - One-repeat runs (`N=1`) are useful for smoke tests only, not conclusions.
+
+### 6a) Controller-first ordering for S1/S2
+
+S1 and S2 require the controller to be running **before** the pods enter
+`Running`. Concretely:
+
+- **S1** sets the `decomposition.dat6.io/drain` readiness gate to `True` on
+  active pods. If the controller is not running, the gate stays `False` (the
+  default for unset gates) and the pod's overall `Ready` condition will be
+  `False`, which means the rollout can stall at `0/N available`.
+
+- **S2** additionally relies on the controller patching the
+  `decomposition.dat6.io/finalizer` onto each pod **before** it terminates.
+  Once a pod has its `deletionTimestamp` set, Kubernetes may finish removing
+  the pod resource before the controller can patch the finalizer in;
+  `add_pod_finalizer` is best-effort in that branch but the deletion-gating
+  it provides is no longer guaranteed. The supported flow is:
+
+  1. Start the controller with `DAT6_EARLY_READINESS_REMOVAL=1
+     DAT6_DRAIN_VERIFICATION=1`.
+  2. Apply the S2 overlay; wait for pods to become `Running`.
+  3. Verify the finalizer is present:
+     `kubectl get pod -l app=drainable-service -o jsonpath='{.items[*].metadata.finalizers}'`
+  4. Then run the scenario.
+
+  `run_all_auto.sh` already does (1)→(2) in this order for non-`baseline`
+  strategies; do not deploy first and start the controller afterwards.
+
+### 6b) Graceful drain in the app
+
+S1 and S2 only matter if the app stays alive long enough for in-flight
+requests to complete (S1) and for `/drainez` to be polled (S2). The app
+opts in via `DAT6_GRACEFUL_DRAIN=1` (already wired in the S1/S2 overlays).
+The baseline overlay deliberately omits it so the comparison shows the
+baseline's "no graceful shutdown" behavior. If you change overlays, keep
+this asymmetry in mind.
+
+### 6c) kind testbed: NodePort propagation race is not reproducible
+
+This is the **most important methodology limitation** of this repo. The
+canonical "endpoint propagation race" — kube-proxy still sending traffic to a
+pod that has begun termination because Endpoints/EndpointSlice updates have
+not yet reached every node — is *not* observable on a single-node kind
+cluster, and is only marginally observable on a multi-node kind cluster.
+
+Why:
+
+- On the control-plane node where NodePort is exposed, kube-proxy updates
+  iptables/nftables in microseconds after the local Endpoints object changes.
+  Requests that hit the NodePort at that node are routed to the new endpoint
+  set immediately.
+- All kind nodes run on the same Linux host, sharing the kernel's networking
+  stack, so the inter-node propagation window real clusters have (etcd ->
+  kube-controller-manager -> kube-apiserver -> watch -> per-node kube-proxy
+  -> per-node iptables) collapses to a function call.
+- NodePort traffic from the host (`http://127.0.0.1:30080`) lands on the
+  control-plane node, whose proxy update is the fastest; it sees the change
+  before any in-flight request can even arrive at a dying pod.
+
+What this means for our metrics:
+
+- **Baseline loss is essentially 0% in this testbed.** That is *not*
+  evidence that the baseline is fine — it is evidence that the testbed cannot
+  reproduce the failure mode. Do not draw "S1/S2 are unnecessary" conclusions
+  from a kind run.
+- The fault we *can* observe in kind is the in-process one: the app dying
+  mid-request because there is no SIGTERM handler. That is what the
+  `DAT6_GRACEFUL_DRAIN=1` toggle exposes.
+- For empirical validation of the endpoint-propagation hypothesis, the thesis
+  needs a real multi-node cluster where kube-proxy on a *different* node from
+  the dying pod is the one routing client traffic. Practically this means a
+  small VPS-based cluster (e.g. 3 worker VMs + 1 control plane) with the
+  client connecting through a node that does *not* host the pod under test,
+  or an actual cloud LB in front of the Service. Document this constraint
+  explicitly in the methodology chapter.
 
 ---
 
