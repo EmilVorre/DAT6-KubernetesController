@@ -94,6 +94,21 @@ make run-repeats N=5 SCENARIO=rollout STRAT=s2-drain-verification
 
 Output: `runs/<timestamp>-<scenario>-<strat>-repeats/` with `run_1/` … `run_N/`, `summary_repeats.csv`, and `aggregate.json`.
 
+Load generation targets the service via kind NodePort on `http://127.0.0.1:30080` to avoid
+`kubectl port-forward` disconnects during rollout.
+
+For stronger differentiation between baseline/S1/S2 under churn, use:
+
+```bash
+EXP_PROFILE=thesis-stress make run-all-auto N=5
+```
+
+You can also override k6 settings directly:
+
+```bash
+K6_RPS=300 K6_VUS=30 K6_DURATION=120s make run-repeats N=5 SCENARIO=rollout STRAT=baseline
+```
+
 To run a full comparison matrix (baseline + S1 + S2 across rollout + steady_scale_down):
 
 ```bash

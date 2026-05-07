@@ -55,11 +55,12 @@ metadata:
   labels:
     app: drainable-service
 spec:
-  type: ClusterIP
+  type: NodePort
   ports:
     - port: 80
       targetPort: 8080
       protocol: TCP
       name: http
+      nodePort: 30080
   selector:
     app: drainable-service

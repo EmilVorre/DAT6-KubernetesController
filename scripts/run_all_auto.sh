@@ -81,8 +81,15 @@ for strat in "${STRATS[@]}"; do
     echo "=== ${strat} / ${scenario} ==="
     make cluster-reset
     make deploy-prometheus
-    make deploy-baseline K8S_OVERLAY="${strat}"
-    start_controller "${strat}"
+    # For S1/S2 overlays, controller must already be running so it can set
+    # readiness gate True on active pods; otherwise rollout can stall at 0/3 available.
+    if [[ "${strat}" == "baseline" ]]; then
+      make deploy-baseline K8S_OVERLAY="${strat}"
+      start_controller "${strat}"
+    else
+      start_controller "${strat}"
+      make deploy-baseline K8S_OVERLAY="${strat}"
+    fi
 
     run_ts="$(date +%Y%m%d-%H%M%S)"
     TIMESTAMP="${run_ts}" RUN_DIR="${RUN_DIR}" make run-repeats N="${N}" SCENARIO="${scenario}" STRAT="${strat}"
