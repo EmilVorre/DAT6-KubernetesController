@@ -118,3 +118,7 @@ export function burst() {
   customLatency.add(res.timings.duration);
   sleep(0.01);
 }
+
+export default function() {
+  steady();
+}

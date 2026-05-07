@@ -7,5 +7,10 @@ spec:
   template:
     spec:
       terminationGracePeriodSeconds: 30
+      containers:
+        - name: drainable-service
+          env:
+            - name: SLEEP_MS
+              value: "500"
       readinessGates:
         - conditionType: decomposition.dat6.io/drain

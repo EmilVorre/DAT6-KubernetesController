@@ -6,4 +6,9 @@ spec:
   template:
     spec:
       terminationGracePeriodSeconds: 30
+      containers:
+        - name: drainable-service
+          env:
+            - name: SLEEP_MS
+              value: "500"
       # No preStop — baseline for comparison

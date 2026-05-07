@@ -80,7 +80,7 @@ for strat in "${STRATS[@]}"; do
   for scenario in "${SCENARIOS[@]}"; do
     echo "=== ${strat} / ${scenario} ==="
     make cluster-reset
-    make deploy-prometheus
+    # make deploy-prometheus   # not needed for loss metrics
     # For S1/S2 overlays, controller must already be running so it can set
     # readiness gate True on active pods; otherwise rollout can stall at 0/3 available.
     if [[ "${strat}" == "baseline" ]]; then

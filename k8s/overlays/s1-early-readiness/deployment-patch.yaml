@@ -9,6 +9,11 @@ spec:
   template:
     spec:
       terminationGracePeriodSeconds: 30
+      containers:
+        - name: drainable-service
+          env:
+            - name: SLEEP_MS
+              value: "500"
       # Custom readiness gate: controller sets this to False on termination (S1).
       readinessGates:
         - conditionType: decomposition.dat6.io/drain
