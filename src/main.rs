@@ -75,9 +75,9 @@ async fn main() -> Result<(), kube::Error> {
         health::spawn_server(addr);
     };
 
-    let pods: Api<Pod> = Api::all(client.clone());
-    let deployments: Api<Deployment> = Api::all(client.clone());
-    let statefulsets: Api<StatefulSet> = Api::all(client.clone());
+    let pods: Api<Pod> = Api::namespaced(client.clone(), "default");
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), "default");
+    let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), "default");
 
     info!("starting watchers: Pods, Deployments, StatefulSets");
 

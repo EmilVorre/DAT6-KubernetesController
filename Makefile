@@ -44,15 +44,19 @@ deploy-prometheus:
 deploy-kube-state-metrics:
 	@echo "kube-state-metrics is included in kube-prometheus-stack. Run 'make deploy-prometheus'."
 
-# --- Build & load drainable service ---
+# --- Build & push drainable service ---
 build-app:
-	docker build -t $(APP_IMAGE) -f app/Dockerfile app/
+	docker build -t ghcr.io/emilvorre/drainable-service:latest -f app/Dockerfile app/
 
+push-app: build-app
+	docker push ghcr.io/emilvorre/drainable-service:latest
+
+# kept for kind compatibility but not used in Hetzner workflow
 load-app:
 	kind load docker-image $(APP_IMAGE) --name $(CLUSTER_NAME)
 
 # --- Deploy baseline workload ---
-deploy-baseline: build-app load-app
+deploy-baseline:
 	kubectl apply -k k8s/overlays/$(K8S_OVERLAY) -n $(APP_NAMESPACE)
 	@echo "Waiting for deployment..."
 	kubectl rollout status deployment/drainable-service -n $(APP_NAMESPACE) --timeout=120s

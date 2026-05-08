@@ -27,7 +27,7 @@ spec:
         - name: drainable-service
           env:
             - name: SLEEP_MS
-              value: "500"
+              value: "2000"
             - name: DAT6_GRACEFUL_DRAIN
               value: "1"
             - name: DAT6_DRAIN_MAX_SECS

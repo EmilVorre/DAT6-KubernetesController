@@ -63,6 +63,7 @@ export const options = {
   // some experiments are *expected* to exceed that rate (the whole point of
   // baseline). Fail thresholds are handled in post-processing.
   thresholds: {
+    http_req_failed: [`rate<0.1`],
     http_req_duration: ['p(99)<5000'],
   },
   // Track non-2xx as failures explicitly rather than relying on default tags.
@@ -76,7 +77,8 @@ function buildScenarios() {
     timeUnit: '1s',
     duration: DURATION,
     preAllocatedVUs: VUS,
-    maxVUs: VUS * 2,
+    maxVUs: VUS * 3,
+    gracefulStop: '0s',
   };
   // `per-vu-iterations` issues exactly N iterations per VU. Failed iterations
   // are recorded; nothing is silently retried by the executor. Useful when we

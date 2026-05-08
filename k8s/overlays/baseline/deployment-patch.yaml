@@ -15,5 +15,5 @@ spec:
         - name: drainable-service
           env:
             - name: SLEEP_MS
-              value: "500"
+              value: "2000"
       # No preStop — baseline for comparison.

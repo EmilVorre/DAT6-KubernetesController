@@ -14,7 +14,7 @@ SCENARIO="${1:-steady_scale_down}"
 STRAT="${2:-baseline}"
 OUTPUT_DIR="${3:-runs/$(date +%Y%m%d-%H%M%S)-${SCENARIO}-${STRAT}}"
 CLUSTER_NAME="${CLUSTER_NAME:-dat6-testbed}"
-SVC_URL="${SVC_URL:-http://127.0.0.1:30080}"
+SVC_URL="${SVC_URL:-http://10.43.3.26:80}"
 EXP_PROFILE="${EXP_PROFILE:-standard}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -24,9 +24,9 @@ echo "Scenario: $SCENARIO | Strategy: $STRAT | Profile: $EXP_PROFILE"
 
 case "$EXP_PROFILE" in
   thesis-stress)
-    K6_DURATION="${K6_DURATION:-120s}"
-    K6_VUS="${K6_VUS:-20}"
-    K6_RPS="${K6_RPS:-250}"
+    K6_DURATION="${K6_DURATION:-150s}"
+    K6_VUS="${K6_VUS:-100}"
+    K6_RPS="${K6_RPS:-50}"
     K6_SCENARIO="${K6_SCENARIO:-steady}"
     ;;
   standard|*)
@@ -55,9 +55,8 @@ fi
 
 # Wait briefly for service routing
 sleep 3
-if ! curl -sf "$SVC_URL/healthz" >/dev/null; then
+if ! ssh root@178.105.96.143 "curl -sf http://10.43.3.26:80/healthz" >/dev/null; then
   echo "ERROR: drainable-service not reachable at $SVC_URL"
-  echo "Hint: run 'make cluster-reset' after kind config changes so port 30080 is mapped."
   exit 1
 fi
 
@@ -68,14 +67,16 @@ trap "kill $EV_PID 2>/dev/null || true" EXIT
 
 # 1. Start load in background
 echo "Starting load (k6)..."
-k6 run \
-  --out json="$OUTPUT_DIR/k6_results.json" \
-  --env TARGET_URL="$SVC_URL" \
-  --env SCENARIO="$K6_SCENARIO" \
-  --env DURATION="$K6_DURATION" \
-  --env VUS="$K6_VUS" \
-  --env RPS="$K6_RPS" \
-  "$SCRIPT_DIR/scripts/k6/load.js" &
+scp "$SCRIPT_DIR/scripts/k6/load.js" root@178.105.96.143:/tmp/load.js
+
+ssh -t root@178.105.96.143 "k6 run \
+  --out json=/tmp/k6_results.json \
+  --env TARGET_URL=http://10.43.3.26:80 \
+  --env SCENARIO=$K6_SCENARIO \
+  --env DURATION=$K6_DURATION \
+  --env VUS=$K6_VUS \
+  --env RPS=$K6_RPS \
+  /tmp/load.js" &
 K6_PID=$!
 
 # Let load stabilize
@@ -102,6 +103,9 @@ esac
 
 # 3. Wait for k6 to finish
 wait $K6_PID 2>/dev/null || true
+
+# After wait $K6_PID
+scp root@178.105.96.143:/tmp/k6_results.json "$OUTPUT_DIR/k6_results.json"
 
 # 4. Stop event watch and capture a sorted snapshot too.
 kill $EV_PID 2>/dev/null || true
