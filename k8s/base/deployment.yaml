@@ -5,12 +5,12 @@ metadata:
   labels:
     app: drainable-service
 spec:
-  replicas: 3
+  replicas: 6
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
+      maxUnavailable: 2
+      maxSurge: 0
   selector:
     matchLabels:
       app: drainable-service

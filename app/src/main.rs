@@ -181,6 +181,7 @@ async fn shutdown_signal(drain_max: Duration) {
         let in_flight = IN_FLIGHT_COUNT.load(Ordering::SeqCst);
         if in_flight == 0 {
             info!("drain complete; in-flight = 0");
+            tokio::time::sleep(Duration::from_secs(2)).await;
             break;
         }
         if start.elapsed() >= drain_max {

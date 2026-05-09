@@ -1,44 +1,39 @@
 #!/usr/bin/env bash
-# Run a scenario N times and produce stable aggregated metrics.
+# Run a single (scenario, strat) combo N times and aggregate results.
 #
-# Usage: ./run_repeats.sh [N] [SCENARIO] [STRAT]
-#   N: number of repeats (default 5)
-#   SCENARIO: steady_scale_down | rollout | delete_pod
-#   STRAT: baseline | s1-early-readiness | long-requests | burst | ...
+# Usage:
+#   bash scripts/run_repeats.sh N SCENARIO STRAT
 #
-# Output: runs/<timestamp>-<scenario>-<strat>-repeats/
-#   run_1/ ... run_N/   — same structure as run_scenario.sh (summary.csv, client_results.json, ...)
-#   summary_repeats.csv — all runs concatenated (run,total,errors,loss_pct,p50_ms,p95_ms,p99_ms)
-#   aggregate.json      — mean, min, max (and optional std) for loss_pct, p50_ms, p95_ms, p99_ms
+# This script does NOT manage the controller or deployment — it assumes
+# both are already in the right state. run_all_auto.sh handles that for
+# matrix runs. For standalone use, deploy the overlay yourself first:
 #
-# Requires: kubectl, k6, python3, kind cluster; for S1 also run controller with DAT6_EARLY_READINESS_REMOVAL=1
+#   make deploy STRAT=s1-early-readiness
+#   bash scripts/run_repeats.sh 5 rollout s1-early-readiness
 
 set -euo pipefail
 
 N="${1:-5}"
-SCENARIO="${2:-steady_scale_down}"
+SCENARIO="${2:-rollout}"
 STRAT="${3:-baseline}"
-TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="${RUN_DIR:-runs}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUTPUT_PARENT="$RUN_DIR/${TIMESTAMP}-${SCENARIO}-${STRAT}-repeats"
+TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
+OUTPUT_PARENT="${RUN_DIR}/${TIMESTAMP}-${SCENARIO}-${STRAT}-repeats"
 
-echo "Running $N repeats: SCENARIO=$SCENARIO STRAT=$STRAT"
-echo "Output parent: $OUTPUT_PARENT"
-mkdir -p "$OUTPUT_PARENT"
+mkdir -p "${OUTPUT_PARENT}"
 
-for i in $(seq 1 "$N"); do
-  echo "--- Repeat $i / $N ---"
-  RUN_PATH="$OUTPUT_PARENT/run_$i"
-  bash "$SCRIPT_DIR/scripts/run_scenario.sh" "$SCENARIO" "$STRAT" "$RUN_PATH"
-  if command -v python3 &>/dev/null; then
-    python3 "$SCRIPT_DIR/scripts/plot_timeline.py" "$RUN_PATH" 2>/dev/null || true
-  fi
+echo "  Running ${N} repeats of ${SCENARIO}/${STRAT}"
+echo "  Output: ${OUTPUT_PARENT}"
+
+for i in $(seq 1 "${N}"); do
+  echo "  --- Repeat ${i}/${N} ---"
+  RUN_PATH="${OUTPUT_PARENT}/run_${i}"
+  bash "${ROOT_DIR}/scripts/run_scenario.sh" "${SCENARIO}" "${STRAT}" "${RUN_PATH}"
+  python3 "${ROOT_DIR}/scripts/plot_timeline.py" "${RUN_PATH}" 2>/dev/null || true
 done
 
-# Aggregate: summary_repeats.csv + aggregate.json
-if command -v python3 &>/dev/null; then
-  python3 "$SCRIPT_DIR/scripts/aggregate_repeats.py" "$OUTPUT_PARENT" "$N" 2>/dev/null || true
-fi
+python3 "${ROOT_DIR}/scripts/aggregate_repeats.py" "${OUTPUT_PARENT}" "${N}"
 
-echo "Done. Results in $OUTPUT_PARENT (summary_repeats.csv, aggregate.json)"
+echo "  Aggregated: ${OUTPUT_PARENT}/summary_repeats.csv"

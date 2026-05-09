@@ -22,7 +22,7 @@ metadata:
 spec:
   template:
     spec:
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 1
       containers:
         - name: drainable-service
           env:

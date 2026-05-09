@@ -1,149 +1,94 @@
-# DAT6-KubernetesController — baseline + testbed
-# Reproducible experiments for safe container decomposition research
+# DAT6-KubernetesController — experiment runner
+#
+# All real logic lives in scripts/. This Makefile is just thin entry points.
+#
+# Common workflows
+# ----------------
+# Smoke test (1 repeat per combo, ~20 min):
+#   make run-all-auto N=1
+#
+# Full matrix (5 repeats per combo, ~90 min):
+#   make run-all-auto N=5
+#
+# Single combo:
+#   make run-combo STRAT=baseline SCENARIO=rollout N=3
+#
+# Kill any in-flight experiment (handles duplicate processes too):
+#   make stop
+#
+# Sanity-check what's deployed right now:
+#   make verify-env
+#
+# Profile / load overrides
+# ------------------------
+# EXP_PROFILE=thesis-stress      RPS=250, VUS=250, DURATION=150s   (default)
+# EXP_PROFILE=standard           RPS=50,  VUS=50,  DURATION=90s
+# K6_RPS=400 K6_VUS=400          override individual knobs
 
-CLUSTER_NAME ?= dat6-testbed
-KIND_CONFIG ?= kind/cluster.yaml
-K8S_BASE ?= k8s/base
-K8S_OVERLAY ?= baseline
-SCENARIO ?= steady_scale_down
-STRAT ?= baseline
-RUN_DIR ?= runs
-TIMESTAMP ?= $(shell date +%Y%m%d-%H%M%S)
-APP_IMAGE ?= drainable-service:latest
 APP_NAMESPACE ?= default
+N            ?= 5
+STRAT        ?= baseline
+SCENARIO     ?= rollout
+EXP_PROFILE  ?= thesis-stress
 
-.PHONY: cluster-up cluster-down cluster-status cluster-reset
-.PHONY: deploy-baseline deploy-prometheus deploy-kube-state-metrics
-.PHONY: build-app load-app run run-repeats run-all run-all-auto clean help
+.PHONY: help build-app push-app deploy undeploy run-all-auto run-combo stop verify-env clean
 
-# --- Cluster lifecycle ---
-cluster-up:
-	kind create cluster --name $(CLUSTER_NAME) --config $(KIND_CONFIG)
-	@echo "Cluster $(CLUSTER_NAME) is up. Run 'make deploy-prometheus' then 'make deploy-baseline'."
+help:
+	@echo "DAT6 experiment runner"
+	@echo ""
+	@echo "Run experiments:"
+	@echo "  make run-all-auto N=1            Smoke test"
+	@echo "  make run-all-auto N=5            Full matrix"
+	@echo "  make run-combo STRAT=s1-early-readiness SCENARIO=rollout N=3"
+	@echo ""
+	@echo "Process control:"
+	@echo "  make stop                        Kill any running experiment"
+	@echo "  make verify-env                  Show DAT6_* env on a running pod"
+	@echo ""
+	@echo "Image build:"
+	@echo "  make build-app                   docker build"
+	@echo "  make push-app                    docker push to GHCR"
+	@echo ""
+	@echo "Manual deploy:"
+	@echo "  make deploy STRAT=baseline       Apply overlay (no controller, no test)"
+	@echo "  make undeploy                    Delete deployment"
+	@echo ""
+	@echo "Profile (env var; override on command line):"
+	@echo "  EXP_PROFILE=standard make run-all-auto N=1"
+	@echo "  K6_RPS=400 K6_VUS=400 make run-all-auto N=3"
 
-cluster-down:
-	kind delete cluster --name $(CLUSTER_NAME)
-
-cluster-reset:
-	kind delete cluster --name $(CLUSTER_NAME) || true
-	$(MAKE) cluster-up
-
-cluster-status:
-	kubectl cluster-info --context kind-$(CLUSTER_NAME)
-	kubectl get nodes -o wide
-
-# --- Observability stack (Helm) ---
-deploy-prometheus:
-	helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
-	helm repo update
-	helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
-		--namespace observability --create-namespace \
-		-f observability/prometheus/values.yaml \
-		--wait --timeout 5m
-
-deploy-kube-state-metrics:
-	@echo "kube-state-metrics is included in kube-prometheus-stack. Run 'make deploy-prometheus'."
-
-# --- Build & push drainable service ---
+# --- image ---
 build-app:
 	docker build -t ghcr.io/emilvorre/drainable-service:latest -f app/Dockerfile app/
 
 push-app: build-app
 	docker push ghcr.io/emilvorre/drainable-service:latest
 
-# kept for kind compatibility but not used in Hetzner workflow
-load-app:
-	kind load docker-image $(APP_IMAGE) --name $(CLUSTER_NAME)
-
-# --- Deploy baseline workload ---
-deploy-baseline:
-	kubectl apply -k k8s/overlays/$(K8S_OVERLAY) -n $(APP_NAMESPACE)
-	@echo "Waiting for deployment..."
+# --- manual deploy / undeploy ---
+deploy:
+	kubectl apply -k k8s/overlays/$(STRAT) -n $(APP_NAMESPACE)
 	kubectl rollout status deployment/drainable-service -n $(APP_NAMESPACE) --timeout=120s
 
-undeploy-baseline:
-	kubectl delete -k k8s/overlays/$(K8S_OVERLAY) --ignore-not-found --wait=false
+undeploy:
+	kubectl delete deployment drainable-service -n $(APP_NAMESPACE) --ignore-not-found
+	kubectl wait --for=delete deployment/drainable-service -n $(APP_NAMESPACE) --timeout=60s 2>/dev/null || true
 
-# --- Run scenario ---
-run:
-	bash scripts/run_scenario.sh $(SCENARIO) $(STRAT) $(RUN_DIR)/$(TIMESTAMP)-$(SCENARIO)-$(STRAT)
-
-# --- Run scenario N times and aggregate metrics ---
-N ?= 5
-run-repeats:
-	bash scripts/run_repeats.sh $(N) $(SCENARIO) $(STRAT)
-
-run-all:
-	@set -euo pipefail; \
-	N_RUNS="$(N)"; \
-	STAMP="$${TIMESTAMP:-$$(date +%Y%m%d-%H%M%S)}"; \
-	COMPARE_DIR="$(RUN_DIR)/compare-$$STAMP"; \
-	STRATS="baseline s1-early-readiness s2-drain-verification"; \
-	SCENARIOS="rollout steady_scale_down"; \
-	mkdir -p "$$COMPARE_DIR"; \
-	for strat in $$STRATS; do \
-	  for scenario in $$SCENARIOS; do \
-	    echo "=== $$strat / $$scenario ==="; \
-	    $(MAKE) cluster-reset; \
-	    $(MAKE) deploy-baseline K8S_OVERLAY=$$strat; \
-	    if [ "$$strat" = "baseline" ]; then \
-	      echo "Run controller without strategy flags for baseline."; \
-	    elif [ "$$strat" = "s1-early-readiness" ]; then \
-	      echo "Run controller with DAT6_EARLY_READINESS_REMOVAL=1."; \
-	    else \
-	      echo "Run controller with DAT6_EARLY_READINESS_REMOVAL=1 DAT6_DRAIN_VERIFICATION=1."; \
-	    fi; \
-	    run_ts="$$(date +%Y%m%d-%H%M%S)"; \
-	    TIMESTAMP="$$run_ts" RUN_DIR="$(RUN_DIR)" $(MAKE) run-repeats N="$$N_RUNS" SCENARIO="$$scenario" STRAT="$$strat"; \
-	    src_dir="$(RUN_DIR)/$$run_ts-$$scenario-$$strat-repeats"; \
-	    dst_dir="$$COMPARE_DIR/$$strat-$$scenario"; \
-	    rm -rf "$$dst_dir"; \
-	    cp -a "$$src_dir" "$$dst_dir"; \
-	  done; \
-	done; \
-	python3 scripts/compare.py "$$COMPARE_DIR"
-
+# --- experiments ---
 run-all-auto:
-	bash scripts/run_all_auto.sh $(N)
+	EXP_PROFILE=$(EXP_PROFILE) bash scripts/run_all_auto.sh $(N)
 
-# --- Full setup (cluster + prometheus + baseline) ---
-setup: cluster-up
-	@echo "Waiting for cluster to be ready..."
-	sleep 15
-	$(MAKE) deploy-prometheus
-	$(MAKE) deploy-baseline K8S_OVERLAY=baseline
+run-combo:
+	EXP_PROFILE=$(EXP_PROFILE) bash scripts/run_repeats.sh $(N) $(SCENARIO) $(STRAT)
 
-# --- Cleanup ---
+# --- process control / debugging ---
+stop:
+	bash scripts/stop_experiment.sh
+
+verify-env:
+	@echo "Deployment overlay label:"
+	@kubectl get deployment drainable-service -o jsonpath='{.metadata.labels.app\.kubernetes\.io/component}{"\n"}' 2>/dev/null | sed 's/^/  /' || echo "  (no deployment)"
+	@echo "Env on first pod:"
+	@kubectl exec deploy/drainable-service -- env 2>/dev/null | grep -E '^(SLEEP_MS|DAT6_)' | sed 's/^/  /' || echo "  (none)"
+
 clean:
-	$(MAKE) undeploy-baseline 2>/dev/null || true
-	$(MAKE) cluster-down 2>/dev/null || true
-
-help:
-	@echo "DAT6 Baseline + Testbed"
-	@echo ""
-	@echo "Cluster:"
-	@echo "  make cluster-up          Create kind cluster"
-	@echo "  make cluster-down        Delete kind cluster"
-	@echo "  make cluster-status      Show cluster info"
-	@echo ""
-	@echo "Deploy:"
-	@echo "  make deploy-prometheus   Install Prometheus stack"
-	@echo "  make deploy-baseline     Build, load, deploy drainable service"
-	@echo "  make deploy-baseline K8S_OVERLAY=long-requests"
-	@echo "  make deploy-baseline K8S_OVERLAY=burst"
-	@echo ""
-	@echo "Run:"
-	@echo "  make run SCENARIO=steady_scale_down STRAT=baseline"
-	@echo "  make run SCENARIO=steady_scale_down STRAT=long-requests"
-	@echo "  make run SCENARIO=rollout STRAT=s1-early-readiness"
-	@echo "  make run SCENARIO=rollout STRAT=s2-drain-verification"
-	@echo ""
-	@echo "Run N repeats (stable metrics):"
-	@echo "  make run-repeats N=5 SCENARIO=steady_scale_down STRAT=baseline"
-	@echo "  make run-repeats N=5 SCENARIO=rollout STRAT=s1-early-readiness"
-	@echo "  make run-repeats N=5 SCENARIO=rollout STRAT=s2-drain-verification"
-	@echo "  make run-all N=5"
-	@echo "  make run-all-auto N=5"
-	@echo ""
-	@echo "Full setup:"
-	@echo "  make setup               cluster-up + prometheus + baseline"
+	rm -rf runs/

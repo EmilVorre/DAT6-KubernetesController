@@ -1,128 +1,163 @@
 #!/usr/bin/env bash
-# Scenario runner: deploy workload, run load, trigger shutdown, collect results.
+# Run one scenario × strat: deploy (idempotent), generate load, trigger
+# shutdown event, collect k6 + k8s events, summarize.
 #
-# Usage: ./run_scenario.sh SCENARIO STRAT OUTPUT_DIR
-#   SCENARIO: steady_scale_down | rollout | delete_pod
-#   STRAT: baseline | s1-early-readiness | s2-drain-verification | long-requests | burst | baseline-prestop-bad
-#   OUTPUT_DIR: e.g. runs/20240216-120000-steady_scale_down-baseline
+# Usage:
+#   bash scripts/run_scenario.sh SCENARIO STRAT OUTPUT_DIR
 #
-# Requires: kubectl, k6, kind cluster with drainable-service image loaded
+# Profile / load knobs (env, override on command line):
+#   EXP_PROFILE   thesis-stress (default) | standard
+#   K6_RPS        override RPS (defaults from profile)
+#   K6_VUS        override VUs
+#   K6_DURATION   override duration
+#
+# Cluster knobs:
+#   LOAD_HOST     ssh host running k6 (default: root@178.105.96.143)
+#   SVC_URL       cluster URL the load hits (default: http://10.43.3.26:80)
 
 set -euo pipefail
 
-SCENARIO="${1:-steady_scale_down}"
+SCENARIO="${1:-rollout}"
 STRAT="${2:-baseline}"
 OUTPUT_DIR="${3:-runs/$(date +%Y%m%d-%H%M%S)-${SCENARIO}-${STRAT}}"
-CLUSTER_NAME="${CLUSTER_NAME:-dat6-testbed}"
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# --- load generator ---
+LOAD_HOST="${LOAD_HOST:-root@178.105.96.143}"
 SVC_URL="${SVC_URL:-http://10.43.3.26:80}"
-EXP_PROFILE="${EXP_PROFILE:-standard}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-mkdir -p "$OUTPUT_DIR"
-echo "Output: $OUTPUT_DIR"
-echo "Scenario: $SCENARIO | Strategy: $STRAT | Profile: $EXP_PROFILE"
-
-case "$EXP_PROFILE" in
+# --- profile-driven k6 settings ---
+# IMPORTANT: thesis-stress must actually be high RPS. The previous version
+# of this script set RPS=50 in BOTH profiles (only VUS/duration differed),
+# which silently capped load at the standard profile's rate regardless of
+# the EXP_PROFILE selection. Don't undo this.
+EXP_PROFILE="${EXP_PROFILE:-thesis-stress}"
+case "${EXP_PROFILE}" in
   thesis-stress)
+    K6_RPS="${K6_RPS:-250}"
+    K6_VUS="${K6_VUS:-250}"
     K6_DURATION="${K6_DURATION:-150s}"
-    K6_VUS="${K6_VUS:-100}"
-    K6_RPS="${K6_RPS:-50}"
-    K6_SCENARIO="${K6_SCENARIO:-steady}"
     ;;
   standard|*)
-    K6_DURATION="${K6_DURATION:-90s}"
-    K6_VUS="${K6_VUS:-10}"
     K6_RPS="${K6_RPS:-50}"
-    K6_SCENARIO="${K6_SCENARIO:-steady}"
+    K6_VUS="${K6_VUS:-50}"
+    K6_DURATION="${K6_DURATION:-90s}"
     ;;
 esac
+K6_SCENARIO="${K6_SCENARIO:-steady}"
 
-# Save scenario config for reproducibility
-echo "{\"scenario\":\"$SCENARIO\",\"strat\":\"$STRAT\"}" > "$OUTPUT_DIR/scenario_config.json"
+mkdir -p "${OUTPUT_DIR}"
+echo "    → output: ${OUTPUT_DIR}"
+echo "    → profile=${EXP_PROFILE} rps=${K6_RPS} vus=${K6_VUS} duration=${K6_DURATION}"
 
-# Deploy overlay if not already applied
-echo "Ensuring overlay $STRAT is applied..."
-kubectl apply -k "$SCRIPT_DIR/k8s/overlays/$STRAT" --wait=true 2>/dev/null || true
-kubectl rollout status deployment/drainable-service -n default --timeout=120s 2>/dev/null || true
+# Save the run config alongside results
+cat > "${OUTPUT_DIR}/scenario_config.json" <<EOF
+{
+  "scenario": "${SCENARIO}",
+  "strat": "${STRAT}",
+  "profile": "${EXP_PROFILE}",
+  "k6_rps": ${K6_RPS},
+  "k6_vus": ${K6_VUS},
+  "k6_duration": "${K6_DURATION}"
+}
+EOF
 
-# For steady_scale_down, ensure we start with 3 replicas so "scale to 2" is a real scale-down.
-# (After run_1 the cluster is at 2; kubectl apply does not reset replicas due to last-applied-configuration.)
-if [[ "$SCENARIO" == "steady_scale_down" ]]; then
-  echo "Resetting replicas to 3 for scale-down repeat..."
-  kubectl scale deployment drainable-service -n default --replicas=3
-  kubectl rollout status deployment/drainable-service -n default --timeout=120s 2>/dev/null || true
+# --- ensure deployment is in expected state ---
+# Idempotent — when called by run_all_auto.sh, the deployment is already
+# applied, so this is a fast no-op. For standalone use, this brings up
+# the workload.
+kubectl apply -k "${ROOT_DIR}/k8s/overlays/${STRAT}" >/dev/null
+kubectl rollout status deployment/drainable-service --timeout=120s 2>/dev/null || true
+
+# steady_scale_down resets to 6 between repeats. Without this, the previous
+# repeat left replicas=2 and the next "scale to 2" is a silent no-op.
+if [[ "${SCENARIO}" == "steady_scale_down" ]]; then
+  echo "    → resetting replicas=6"
+  kubectl scale deployment drainable-service --replicas=6 >/dev/null
+  kubectl rollout status deployment/drainable-service --timeout=120s 2>/dev/null || true
 fi
 
-# Wait briefly for service routing
 sleep 3
-if ! ssh root@178.105.96.143 "curl -sf http://10.43.3.26:80/healthz" >/dev/null; then
-  echo "ERROR: drainable-service not reachable at $SVC_URL"
+
+# Reachability check
+if ! ssh -o ConnectTimeout=5 "${LOAD_HOST}" "curl -sf ${SVC_URL}/healthz" >/dev/null; then
+  echo "ERROR: drainable-service not reachable at ${SVC_URL}" >&2
   exit 1
 fi
 
-# Start event watch before triggering scenario so we capture rollout/termination sequence.
-kubectl get events -n default --watch-only > "$OUTPUT_DIR/k8s_events_watch.log" 2>/dev/null &
+# --- start event watch ---
+EV_LOG_WATCH="${OUTPUT_DIR}/k8s_events_watch.log"
+EV_LOG_SNAPSHOT="${OUTPUT_DIR}/k8s_events_snapshot.log"
+kubectl get events --watch-only > "${EV_LOG_WATCH}" 2>/dev/null &
 EV_PID=$!
-trap "kill $EV_PID 2>/dev/null || true" EXIT
 
-# 1. Start load in background
-echo "Starting load (k6)..."
-scp "$SCRIPT_DIR/scripts/k6/load.js" root@178.105.96.143:/tmp/load.js
+# Cleanup trap covers Ctrl-C / errors. Kills both local event watcher
+# and remote k6 (if it started).
+cleanup_local() {
+  kill "${EV_PID}" 2>/dev/null || true
+  ssh -o ConnectTimeout=5 "${LOAD_HOST}" \
+    'pkill -9 k6 2>/dev/null || true' 2>/dev/null || true
+}
+trap cleanup_local EXIT INT TERM
 
-ssh -t root@178.105.96.143 "k6 run \
+# --- start k6 on the load host ---
+echo "    → starting k6 on ${LOAD_HOST}"
+scp -q "${ROOT_DIR}/scripts/k6/load.js" "${LOAD_HOST}:/tmp/load.js"
+
+ssh -t "${LOAD_HOST}" "k6 run \
   --out json=/tmp/k6_results.json \
-  --env TARGET_URL=http://10.43.3.26:80 \
-  --env SCENARIO=$K6_SCENARIO \
-  --env DURATION=$K6_DURATION \
-  --env VUS=$K6_VUS \
-  --env RPS=$K6_RPS \
+  --env TARGET_URL=${SVC_URL} \
+  --env SCENARIO=${K6_SCENARIO} \
+  --env DURATION=${K6_DURATION} \
+  --env VUS=${K6_VUS} \
+  --env RPS=${K6_RPS} \
   /tmp/load.js" &
 K6_PID=$!
 
-# Let load stabilize
+# Let load stabilize before triggering the shutdown event
 sleep 15
 
-# 2. Trigger shutdown event
-echo "Triggering shutdown: $SCENARIO"
-case "$SCENARIO" in
+# --- trigger shutdown event ---
+echo "    → triggering ${SCENARIO}"
+case "${SCENARIO}" in
   steady_scale_down)
-    kubectl scale deployment drainable-service -n default --replicas=2
+    kubectl scale deployment drainable-service --replicas=2 >/dev/null
     ;;
   rollout)
-    kubectl rollout restart deployment drainable-service -n default
+    kubectl rollout restart deployment drainable-service >/dev/null
     ;;
   delete_pod)
-    POD=$(kubectl get pods -n default -l app=drainable-service -o jsonpath='{.items[0].metadata.name}')
-    kubectl delete pod "$POD" -n default
+    POD=$(kubectl get pods -l app=drainable-service \
+      -o jsonpath='{.items[0].metadata.name}')
+    kubectl delete pod "${POD}" >/dev/null
     ;;
   *)
-    echo "Unknown scenario: $SCENARIO"
+    echo "ERROR: unknown scenario: ${SCENARIO}" >&2
     exit 1
     ;;
 esac
 
-# 3. Wait for k6 to finish
-wait $K6_PID 2>/dev/null || true
+# --- wait for k6, copy results ---
+wait "${K6_PID}" 2>/dev/null || true
+scp -q "${LOAD_HOST}:/tmp/k6_results.json" "${OUTPUT_DIR}/k6_results.json"
 
-# After wait $K6_PID
-scp root@178.105.96.143:/tmp/k6_results.json "$OUTPUT_DIR/k6_results.json"
+# --- collect events ---
+kill "${EV_PID}" 2>/dev/null || true
+wait "${EV_PID}" 2>/dev/null || true
+trap - EXIT INT TERM
 
-# 4. Stop event watch and capture a sorted snapshot too.
-kill $EV_PID 2>/dev/null || true
-wait $EV_PID 2>/dev/null || true
-kubectl get events -n default --sort-by='.lastTimestamp' > "$OUTPUT_DIR/k8s_events_snapshot.log" 2>/dev/null || true
+kubectl get events --sort-by='.lastTimestamp' > "${EV_LOG_SNAPSHOT}" 2>/dev/null || true
 {
   echo "=== watch_only ==="
-  cat "$OUTPUT_DIR/k8s_events_watch.log" 2>/dev/null || true
+  cat "${EV_LOG_WATCH}" 2>/dev/null || true
   echo ""
   echo "=== snapshot_sorted ==="
-  cat "$OUTPUT_DIR/k8s_events_snapshot.log" 2>/dev/null || true
-} > "$OUTPUT_DIR/k8s_events.log"
+  cat "${EV_LOG_SNAPSHOT}" 2>/dev/null || true
+} > "${OUTPUT_DIR}/k8s_events.log"
 
-# 5. Run collection scripts
-if command -v python3 &>/dev/null; then
-  python3 "$SCRIPT_DIR/scripts/collect_metrics.py" "$OUTPUT_DIR" 2>/dev/null || true
-  python3 "$SCRIPT_DIR/scripts/summarize_run.py" "$OUTPUT_DIR" 2>/dev/null || true
-fi
+# --- summarize ---
+python3 "${ROOT_DIR}/scripts/collect_metrics.py" "${OUTPUT_DIR}" 2>/dev/null || true
+python3 "${ROOT_DIR}/scripts/summarize_run.py" "${OUTPUT_DIR}"
 
-echo "Done. Results in $OUTPUT_DIR"
+echo "    → done"

@@ -10,10 +10,14 @@ metadata:
 spec:
   template:
     spec:
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 1
       containers:
         - name: drainable-service
           env:
             - name: SLEEP_MS
               value: "2000"
+            - name: DAT6_GRACEFUL_DRAIN
+              value: "0"
+            - name: DAT6_DRAIN_MAX_SECS
+              value: "0"
       # No preStop — baseline for comparison.
