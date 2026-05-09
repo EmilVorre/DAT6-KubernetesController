@@ -67,7 +67,7 @@ EOF
 # Idempotent — when called by run_all_auto.sh, the deployment is already
 # applied, so this is a fast no-op. For standalone use, this brings up
 # the workload.
-kubectl apply -k "${ROOT_DIR}/k8s/overlays/${STRAT}" >/dev/null
+kubectl apply -k "${ROOT_DIR}/k8s/app/overlays/${STRAT}" >/dev/null
 kubectl rollout status deployment/drainable-service --timeout=120s 2>/dev/null || true
 
 # steady_scale_down resets to 6 between repeats. Without this, the previous

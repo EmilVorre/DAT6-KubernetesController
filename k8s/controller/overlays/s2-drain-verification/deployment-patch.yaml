@@ -1,0 +1,28 @@
+# S2 — Active Drain Verification (S1 + finalizer + /drainez polling)
+#
+# The whole reason we're moving the controller in-cluster: this overlay's
+# /drainez polls go directly to http://<pod-ip>:8080/drainez. Pod IPs (10.42.x.x
+# under flannel) are NOT routable from outside the cluster, so when the
+# controller ran on the dev box every poll timed out into the unreachable
+# fallback, making S2 == S1 + pointless waiting. From inside the cluster pod
+# network the polls actually reach the target.
+#
+# Verification gate after rollout (from the handoff):
+#   kubectl logs deployment/dat6-controller --tail=2000 | grep -c "drain verified"
+# Must be non-zero (~one per pod killed in the rollout).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dat6-controller
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          env:
+            - name: RUST_LOG
+              value: "info"
+            - name: DAT6_EARLY_READINESS_REMOVAL
+              value: "1"
+            - name: DAT6_DRAIN_VERIFICATION
+              value: "1"

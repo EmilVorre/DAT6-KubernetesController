@@ -1,0 +1,18 @@
+# Keep the build context minimal so `docker build .` doesn't ship the
+# 1.5 GB cargo target tree, all experiment runs, the app/ crate, etc.
+target/
+.git/
+runs/
+app/
+k8s/
+kind/
+bin/
+observability/
+scripts/
+.gopath/
+*.rs.bk
+*.md
+LICENSE
+.dockerignore
+.gitignore
+Dockerfile

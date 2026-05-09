@@ -1,0 +1,75 @@
+# In-cluster controller Deployment (base; overlays patch env per strategy).
+#
+# Replicas
+# --------
+# Single replica. The controller does NOT implement leader election (the
+# kube-rs Controller in src/controller.rs has no lease handling). Running
+# 2+ replicas would race on patches for the same pod and produce undefined
+# behaviour, including double-finalizer-add and competing readiness-gate
+# flips. Keep replicas=1.
+#
+# Image
+# -----
+# imagePullPolicy: Always + :latest matches the app image flow. Every push
+# is paired with `kubectl rollout restart` (see Makefile push-controller)
+# so the new image is actually pulled instead of cached at the node.
+#
+# Network reachability
+# --------------------
+# The whole point of running in-cluster is that pod IPs (10.42.x.x on this
+# k3s+flannel cluster) become routable from this pod. /drainez polling will
+# now actually reach the target pods instead of timing out.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dat6-controller
+  namespace: default
+  labels:
+    app: dat6-controller
+    app.kubernetes.io/name: dat6-controller
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  strategy:
+    # Recreate, not RollingUpdate: we don't want two controllers running
+    # at the same instant during a redeploy (see "Replicas" above).
+    type: Recreate
+  selector:
+    matchLabels:
+      app: dat6-controller
+  template:
+    metadata:
+      labels:
+        app: dat6-controller
+        app.kubernetes.io/name: dat6-controller
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: dat6-controller
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: controller
+          image: ghcr.io/emilvorre/dat6-controller:latest
+          imagePullPolicy: Always
+          env:
+            # RUST_LOG defaults to "info" inside the binary, but set it
+            # explicitly here so it's discoverable via `kubectl describe`.
+            - name: RUST_LOG
+              value: "info"
+            # Strategy flags are intentionally NOT set in base. Overlays
+            # add them so that switching strategies is just `kubectl apply
+            # -k k8s/controller/overlays/<strat>` instead of restarting a
+            # local process.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]

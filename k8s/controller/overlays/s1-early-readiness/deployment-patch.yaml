@@ -1,0 +1,18 @@
+# S1 — Early Readiness Removal
+# Controller flips the decomposition.dat6.io/drain readiness gate to False on
+# terminating pods so the EndpointSlice controller drops them from the
+# Service's endpoints before grace expires.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dat6-controller
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          env:
+            - name: RUST_LOG
+              value: "info"
+            - name: DAT6_EARLY_READINESS_REMOVAL
+              value: "1"

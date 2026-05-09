@@ -37,7 +37,7 @@ async fn main() -> Result<(), kube::Error> {
     let client = Client::try_default().await?;
     let policy = {
         let mut p = DecommissionPolicy::default();
-        // S1 — Early Readiness Removal: set when using k8s/overlays/s1-early-readiness
+        // S1 — Early Readiness Removal: set when using k8s/app/overlays/s1-early-readiness
         p.early_readiness_removal = std::env::var("DAT6_EARLY_READINESS_REMOVAL")
             .as_deref()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

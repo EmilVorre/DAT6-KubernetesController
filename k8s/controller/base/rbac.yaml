@@ -1,0 +1,71 @@
+# Permissions the in-cluster controller needs.
+#
+# Scope rationale
+# ---------------
+# - pods get/list/watch/patch     S1 needs to patch pod readiness gates;
+#                                 reconcile loop needs to watch.
+# - pods/status patch             readinessGate conditions live under
+#                                 .status.conditions, so the patch goes
+#                                 through the /status subresource.
+# - pods/finalizers update        S2 adds and removes
+#                                 decomposition.dat6.io/finalizer; the
+#                                 finalizers slice is also a subresource.
+# - deployments / statefulsets    reconcilers in src/controller.rs watch
+#   get/list/watch                them (no writes today; if/when we patch
+#                                 specs, expand here).
+# - events create/patch           harmless and lets us emit reconcile events
+#                                 if we ever wire them up.
+#
+# ClusterRole (not Role) because the controller's main.rs currently namespaces
+# its watchers to "default" but the kube-rs Controller still needs cluster-wide
+# discovery. Easiest correct grant; tighten to a namespaced Role only after
+# the controller is verified working in-cluster.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dat6-controller
+  namespace: default
+  labels:
+    app: dat6-controller
+    app.kubernetes.io/name: dat6-controller
+    app.kubernetes.io/component: controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dat6-controller
+  labels:
+    app: dat6-controller
+    app.kubernetes.io/name: dat6-controller
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["pods/finalizers"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dat6-controller
+  labels:
+    app: dat6-controller
+    app.kubernetes.io/name: dat6-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dat6-controller
+subjects:
+  - kind: ServiceAccount
+    name: dat6-controller
+    namespace: default

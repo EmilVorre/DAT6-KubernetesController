@@ -25,13 +25,16 @@
 # EXP_PROFILE=standard           RPS=50,  VUS=50,  DURATION=90s
 # K6_RPS=400 K6_VUS=400          override individual knobs
 
-APP_NAMESPACE ?= default
-N            ?= 5
-STRAT        ?= baseline
-SCENARIO     ?= rollout
-EXP_PROFILE  ?= thesis-stress
+APP_NAMESPACE   ?= default
+N               ?= 5
+STRAT           ?= baseline
+SCENARIO        ?= rollout
+EXP_PROFILE     ?= thesis-stress
+CONTROLLER_IMG  ?= ghcr.io/emilvorre/dat6-controller:latest
 
-.PHONY: help build-app push-app deploy undeploy run-all-auto run-combo stop verify-env clean
+.PHONY: help build-app push-app build-controller push-controller \
+        deploy undeploy deploy-controller undeploy-controller \
+        verify-controller run-all-auto run-combo stop verify-env clean
 
 help:
 	@echo "DAT6 experiment runner"
@@ -46,32 +49,90 @@ help:
 	@echo "  make verify-env                  Show DAT6_* env on a running pod"
 	@echo ""
 	@echo "Image build:"
-	@echo "  make build-app                   docker build"
-	@echo "  make push-app                    docker push to GHCR"
+	@echo "  make build-app                   docker build app"
+	@echo "  make push-app                    docker push app to GHCR"
+	@echo "  make build-controller            docker build controller"
+	@echo "  make push-controller             docker push controller, rollout-restart, verify imageID"
 	@echo ""
 	@echo "Manual deploy:"
-	@echo "  make deploy STRAT=baseline       Apply overlay (no controller, no test)"
-	@echo "  make undeploy                    Delete deployment"
+	@echo "  make deploy STRAT=baseline           Apply app overlay"
+	@echo "  make undeploy                        Delete app deployment"
+	@echo "  make deploy-controller STRAT=...     Apply controller overlay"
+	@echo "  make undeploy-controller             Delete controller deployment"
+	@echo "  make verify-controller               Show running controller image + env"
 	@echo ""
 	@echo "Profile (env var; override on command line):"
 	@echo "  EXP_PROFILE=standard make run-all-auto N=1"
 	@echo "  K6_RPS=400 K6_VUS=400 make run-all-auto N=3"
 
-# --- image ---
+# --- image: app ---
 build-app:
 	docker build -t ghcr.io/emilvorre/drainable-service:latest -f app/Dockerfile app/
 
 push-app: build-app
 	docker push ghcr.io/emilvorre/drainable-service:latest
 
-# --- manual deploy / undeploy ---
+# --- image: controller ---
+# Mirrors push-app: build, push, then force a rollout and confirm the new
+# imageID actually landed on the running pod. The verify step matters because
+# imagePullPolicy: Always + :latest can still serve a stale layer if the
+# kubelet's image cache silently hits — we got bitten by exactly this on the
+# app, so we don't trust the rollout until imageID changes.
+build-controller:
+	DOCKER_BUILDKIT=1 docker build -t $(CONTROLLER_IMG) -f Dockerfile .
+
+push-controller: build-controller
+	docker push $(CONTROLLER_IMG)
+	@echo "Capturing pre-rollout controller imageID (if any)..."
+	@before=$$(kubectl get pod -n $(APP_NAMESPACE) -l app=dat6-controller \
+	  -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' 2>/dev/null); \
+	echo "  before: $${before:-<no pod>}"; \
+	if kubectl get deployment dat6-controller -n $(APP_NAMESPACE) >/dev/null 2>&1; then \
+	  kubectl rollout restart deployment/dat6-controller -n $(APP_NAMESPACE); \
+	  kubectl rollout status  deployment/dat6-controller -n $(APP_NAMESPACE) --timeout=120s; \
+	  after=$$(kubectl get pod -n $(APP_NAMESPACE) -l app=dat6-controller \
+	    -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' 2>/dev/null); \
+	  echo "  after:  $${after}"; \
+	  if [ -n "$${before}" ] && [ "$${before}" = "$${after}" ]; then \
+	    echo "ERROR: imageID unchanged after rollout — kubelet served a cached layer."; \
+	    echo "       Try: kubectl delete pod -l app=dat6-controller -n $(APP_NAMESPACE)"; \
+	    exit 1; \
+	  fi; \
+	  echo "  controller is running the freshly-pushed image."; \
+	else \
+	  echo "  (no controller deployment yet; run 'make deploy-controller STRAT=...' to install it)"; \
+	fi
+
+# --- manual deploy / undeploy: app ---
 deploy:
-	kubectl apply -k k8s/overlays/$(STRAT) -n $(APP_NAMESPACE)
+	kubectl apply -k k8s/app/overlays/$(STRAT) -n $(APP_NAMESPACE)
 	kubectl rollout status deployment/drainable-service -n $(APP_NAMESPACE) --timeout=120s
 
 undeploy:
 	kubectl delete deployment drainable-service -n $(APP_NAMESPACE) --ignore-not-found
 	kubectl wait --for=delete deployment/drainable-service -n $(APP_NAMESPACE) --timeout=60s 2>/dev/null || true
+
+# --- manual deploy / undeploy: controller ---
+# `kubectl apply -k` is idempotent: SA + RBAC stay in place across strategy
+# switches, only the Deployment env diff triggers a rollout. To switch
+# strategies cleanly between matrix iterations the runner deletes and
+# re-applies; here we leave the apply-only path for interactive use.
+deploy-controller:
+	kubectl apply -k k8s/controller/overlays/$(STRAT)
+	kubectl rollout status deployment/dat6-controller -n $(APP_NAMESPACE) --timeout=60s
+
+undeploy-controller:
+	kubectl delete deployment dat6-controller -n $(APP_NAMESPACE) --ignore-not-found
+	kubectl wait --for=delete deployment/dat6-controller -n $(APP_NAMESPACE) --timeout=60s 2>/dev/null || true
+
+verify-controller:
+	@echo "Controller pod:"
+	@kubectl get pod -n $(APP_NAMESPACE) -l app=dat6-controller \
+	  -o jsonpath='  {.items[0].metadata.name}  image={.items[0].spec.containers[0].image}  imageID={.items[0].status.containerStatuses[0].imageID}{"\n"}' \
+	  2>/dev/null || echo "  (no controller pod)"
+	@echo "Controller env (DAT6_*):"
+	@kubectl exec -n $(APP_NAMESPACE) deploy/dat6-controller -- env 2>/dev/null \
+	  | grep -E '^DAT6_' | sed 's/^/  /' || echo "  (none)"
 
 # --- experiments ---
 run-all-auto:

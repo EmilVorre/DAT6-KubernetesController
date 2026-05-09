@@ -7,11 +7,29 @@
 # Usage:
 #   bash scripts/run_all_auto.sh [N]          # default N=5
 #
+# Controller lifecycle (in-cluster, kubectl-driven)
+# -------------------------------------------------
+# This script no longer runs `cargo run` locally. The controller is deployed
+# as an in-cluster Deployment (k8s/controller/) so that /drainez polls (S2)
+# can actually reach pod IPs through flannel — pod IPs (10.42.x.x) aren't
+# routable from the dev box, which silently turned every S2 run into "S1 +
+# pointless waiting" via the unreachable fallback.
+#
+# Per strategy we:
+#   1. delete drainable-service                 (clean kustomize merge state)
+#   2. delete dat6-controller                   (clean controller state)
+#   3. kubectl apply -k k8s/controller/overlays/<strat>
+#   4. kubectl rollout status deployment/dat6-controller --timeout=60s
+#   5. kubectl logs -f deployment/dat6-controller > controller-<strat>.log &
+#      (CTRL_LOG_PID tracks the background tail)
+#   6. apply drainable-service overlay; wait for rollout
+#   7. verify pod env, run repeats, kill log tail
+#
 # Bug-prevention features:
 # - Single-instance lock (flock). A second invocation aborts immediately
 #   instead of racing the cluster.
-# - Cleanup trap kills the controller AND remote k6 on any exit path
-#   (success, failure, Ctrl-C).
+# - Cleanup trap deletes the controller deployment AND kills the log-tail
+#   AND remote k6 on any exit path (success, failure, Ctrl-C).
 # - Deletes the deployment between EVERY strat, not just baseline. This
 #   prevents kustomize strategic-merge from leaving env vars behind when
 #   an overlay's patch doesn't mention them (e.g. baseline → s1 leaks
@@ -19,6 +37,13 @@
 #   silently broke previous runs).
 # - Verifies the deployed pod's env after each apply. Halts the matrix
 #   if the env doesn't match what the strat is supposed to produce.
+#
+# Pre-requisites:
+# - The dat6-controller image (ghcr.io/emilvorre/dat6-controller:latest) has
+#   been built+pushed via `make push-controller`.
+# - SA + RBAC are installed (the first `kubectl apply -k` of any controller
+#   overlay does this for you; subsequent applies are no-ops on those
+#   objects since we don't delete them between iterations).
 #
 # Environment overrides (all optional):
 #   EXP_PROFILE   thesis-stress (default) | standard
@@ -63,22 +88,28 @@ cd "${ROOT_DIR}"
 # ---------------------------------------------------------------------------
 # 3. Cleanup trap (covers Ctrl-C, errors, normal exit)
 # ---------------------------------------------------------------------------
-CTRL_PID=""
+CTRL_LOG_PID=""    # `kubectl logs -f` background pid for the current strat
 
 cleanup() {
   local exit_code=$?
   trap - EXIT INT TERM
   echo ""
   echo "--- Cleanup ---"
-  if [[ -n "${CTRL_PID}" ]] && kill -0 "${CTRL_PID}" 2>/dev/null; then
-    echo "  Stopping controller (pgid=${CTRL_PID})"
-    kill -TERM -"${CTRL_PID}" 2>/dev/null || true
-    sleep 2
-    kill -KILL -"${CTRL_PID}" 2>/dev/null || true
-    wait "${CTRL_PID}" 2>/dev/null || true
+  # Stop log tail (if any) before deleting the deployment, otherwise the
+  # tail prints a noisy "container terminated" line as the controller
+  # disappears under it.
+  if [[ -n "${CTRL_LOG_PID}" ]] && kill -0 "${CTRL_LOG_PID}" 2>/dev/null; then
+    echo "  Stopping controller log tail (pid=${CTRL_LOG_PID})"
+    kill -TERM "${CTRL_LOG_PID}" 2>/dev/null || true
+    wait "${CTRL_LOG_PID}" 2>/dev/null || true
   fi
-  # Belt-and-suspenders: any lingering controller binary
-  pkill -9 -f 'target/debug/DAT6_KubernetesController' 2>/dev/null || true
+  # Tear the controller down so the next manual investigation starts from
+  # a known-clean state. SA + RBAC are intentionally left in place.
+  if kubectl get deployment dat6-controller -n default >/dev/null 2>&1; then
+    echo "  Deleting dat6-controller deployment"
+    kubectl delete deployment dat6-controller -n default --ignore-not-found \
+      --wait=false 2>/dev/null || true
+  fi
   # Kill any in-flight k6 on the load host
   ssh -o ConnectTimeout=5 "${LOAD_HOST:-root@178.105.96.143}" \
     'pkill -9 k6 2>/dev/null || true' 2>/dev/null || true
@@ -94,54 +125,74 @@ trap cleanup EXIT INT TERM
 # ---------------------------------------------------------------------------
 # 4. Helpers
 # ---------------------------------------------------------------------------
+# Apply the controller overlay for `strat`, wait for rollout, then start a
+# background `kubectl logs -f` tail into ${COMPARE_DIR}/controller-<strat>.log.
+# CTRL_LOG_PID is set to the tail's pid so stop_controller / cleanup can
+# kill exactly that one process (no setsid / process-group dance required —
+# the controller itself runs as a Deployment, which kubectl delete handles).
 start_controller() {
   local strat="$1"
-  local -a env_vars=()
   case "${strat}" in
-    baseline) ;;
-    s1-early-readiness)
-      env_vars=("DAT6_EARLY_READINESS_REMOVAL=1") ;;
-    s2-drain-verification)
-      env_vars=("DAT6_EARLY_READINESS_REMOVAL=1" "DAT6_DRAIN_VERIFICATION=1") ;;
+    baseline|s1-early-readiness|s2-drain-verification) ;;
     *)
       echo "ERROR: unknown strategy: ${strat}" >&2
       return 1 ;;
   esac
 
+  local overlay="${ROOT_DIR}/k8s/controller/overlays/${strat}"
   local log="${COMPARE_DIR}/controller-${strat}.log"
-  echo "  → Starting controller (log: ${log})"
 
-  # setsid puts cargo + the spawned binary in their own process group, so
-  # `kill -<pgid>` cleanly takes both down. Without this, killing cargo
-  # leaves the compiled binary running.
-  if [[ ${#env_vars[@]} -eq 0 ]]; then
-    setsid bash -c "cd '${ROOT_DIR}' && cargo run --quiet" >"${log}" 2>&1 &
-  else
-    setsid bash -c "cd '${ROOT_DIR}' && env ${env_vars[*]} cargo run --quiet" >"${log}" 2>&1 &
-  fi
-  CTRL_PID=$!
+  echo "  → Applying controller overlay: ${overlay}"
+  kubectl apply -k "${overlay}" >/dev/null
 
-  # Give cargo time to compile (first run) and the controller time to
-  # connect to the apiserver before we start applying manifests.
-  sleep 10
-  if ! kill -0 "${CTRL_PID}" 2>/dev/null; then
-    echo "ERROR: controller failed to start. Tail of ${log}:" >&2
-    tail -20 "${log}" >&2 || true
+  echo "  → Waiting for controller rollout"
+  if ! kubectl rollout status deployment/dat6-controller -n default --timeout=60s; then
+    echo "ERROR: controller rollout failed; recent events:" >&2
+    kubectl get events -n default --sort-by='.lastTimestamp' | tail -20 >&2 || true
+    kubectl describe deployment dat6-controller -n default >&2 || true
     return 1
   fi
-  echo "  → Controller running (pgid=${CTRL_PID})"
+
+  # Verify the controller pod is actually Ready (not just "rollout reports
+  # progress complete"). On image-pull errors `rollout status` can return 0
+  # while the pod is CrashLoopBackOff.
+  if ! kubectl wait --for=condition=Available deployment/dat6-controller \
+       -n default --timeout=30s >/dev/null 2>&1; then
+    echo "ERROR: dat6-controller did not become Available. Tail of describe:" >&2
+    kubectl describe deployment dat6-controller -n default | tail -40 >&2 || true
+    return 1
+  fi
+
+  echo "  → Starting controller log tail (log: ${log})"
+  # `kubectl logs -f deployment/...` follows the current pod's logs and
+  # re-attaches if the pod restarts. nohup keeps it alive if our shell
+  # gets SIGHUP'd; redirect stdin from /dev/null so it doesn't grab the
+  # tty.
+  nohup kubectl logs -f deployment/dat6-controller -n default \
+    >"${log}" 2>&1 </dev/null &
+  CTRL_LOG_PID=$!
+
+  # Show the env that will be in effect for this strat, for the per-run log.
+  local env_seen
+  env_seen="$(kubectl exec -n default deploy/dat6-controller -- env 2>/dev/null \
+    | grep -E '^DAT6_' | sort | tr '\n' ' ' || true)"
+  echo "  → Controller running (log_tail_pid=${CTRL_LOG_PID}); env: ${env_seen:-<none>}"
 }
 
 stop_controller() {
-  if [[ -n "${CTRL_PID}" ]] && kill -0 "${CTRL_PID}" 2>/dev/null; then
-    echo "  → Stopping controller (pgid=${CTRL_PID})"
-    kill -TERM -"${CTRL_PID}" 2>/dev/null || true
-    sleep 2
-    kill -KILL -"${CTRL_PID}" 2>/dev/null || true
-    wait "${CTRL_PID}" 2>/dev/null || true
+  if [[ -n "${CTRL_LOG_PID}" ]] && kill -0 "${CTRL_LOG_PID}" 2>/dev/null; then
+    echo "  → Stopping controller log tail (pid=${CTRL_LOG_PID})"
+    kill -TERM "${CTRL_LOG_PID}" 2>/dev/null || true
+    wait "${CTRL_LOG_PID}" 2>/dev/null || true
   fi
-  pkill -9 -f 'target/debug/DAT6_KubernetesController' 2>/dev/null || true
-  CTRL_PID=""
+  CTRL_LOG_PID=""
+
+  if kubectl get deployment dat6-controller -n default >/dev/null 2>&1; then
+    echo "  → Deleting dat6-controller deployment"
+    kubectl delete deployment dat6-controller -n default --ignore-not-found
+    kubectl wait --for=delete deployment/dat6-controller -n default \
+      --timeout=60s 2>/dev/null || true
+  fi
 }
 
 verify_env() {
@@ -183,12 +234,19 @@ echo "  Strategies: ${STRATS[*]}"
 echo "  Scenarios:  ${SCENARIOS[*]}"
 echo "================================================================"
 
-# Pre-build the controller once so each combo's start_controller doesn't
-# pay the compile cost (and so the 10s startup grace is realistic).
+# Sanity-check that the controller image is reachable in the registry. If
+# `make push-controller` was forgotten this is the friendliest place to
+# fail — early, with a clear message — rather than 60s into the first
+# rollout when the kubelet finally surfaces ImagePullBackOff.
 echo ""
-echo "Pre-building controller..."
-cargo build --quiet
-echo "  → Done."
+echo "Pre-flight: verifying controller manifests parse..."
+for strat in "${STRATS[@]}"; do
+  if ! kubectl kustomize "k8s/controller/overlays/${strat}" >/dev/null; then
+    echo "ERROR: kustomize failed for k8s/controller/overlays/${strat}" >&2
+    exit 1
+  fi
+done
+echo "  → OK."
 
 for strat in "${STRATS[@]}"; do
   for scenario in "${SCENARIOS[@]}"; do
@@ -197,26 +255,23 @@ for strat in "${STRATS[@]}"; do
     echo "  ${strat} / ${scenario}"
     echo "================================================================"
 
-    # Always delete the deployment before the next strat so kustomize
+    # Always delete the app deployment before the next strat so kustomize
     # strategic-merge starts from a clean spec.
-    echo "  → Deleting any existing deployment"
+    echo "  → Deleting any existing app deployment"
     kubectl delete deployment drainable-service --ignore-not-found
     kubectl wait --for=delete deployment/drainable-service \
       --timeout=60s 2>/dev/null || true
 
-    if [[ "${strat}" == "baseline" ]]; then
-      # Baseline: controller has no effect, but run it for symmetry.
-      kubectl apply -k "k8s/overlays/${strat}"
-      kubectl rollout status deployment/drainable-service --timeout=120s
-      start_controller "${strat}"
-    else
-      # S1/S2: controller MUST be running before pods become Ready so it
-      # can flip the readiness gate to True. Otherwise rollout stalls at
-      # 0/N available.
-      start_controller "${strat}"
-      kubectl apply -k "k8s/overlays/${strat}"
-      kubectl rollout status deployment/drainable-service --timeout=120s
-    fi
+    # Controller goes up FIRST for all strategies. For S1/S2 this is
+    # required (the controller must flip the readiness gate to True before
+    # pods can become Ready, and must add the S2 finalizer before pods
+    # start terminating); for baseline it costs nothing because the
+    # reconciler is a no-op without DAT6_EARLY_READINESS_REMOVAL.
+    start_controller "${strat}"
+
+    echo "  → Applying app overlay: k8s/app/overlays/${strat}"
+    kubectl apply -k "k8s/app/overlays/${strat}"
+    kubectl rollout status deployment/drainable-service --timeout=120s
 
     verify_env "${strat}"
 

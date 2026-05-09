@@ -17,8 +17,8 @@ make run SCENARIO=steady_scale_down STRAT=baseline
 |------|------|
 | `kind/cluster.yaml` | kind cluster config (pinned k8s v1.31.14) |
 | `app/` | Drainable HTTP service (Rust + axum) |
-| `k8s/base/` | Deployment + Service (Kustomize base) |
-| `k8s/overlays/` | baseline, long-requests, burst, baseline-prestop-bad |
+| `k8s/app/base/` | Deployment + Service (Kustomize base) |
+| `k8s/app/overlays/` | baseline, long-requests, burst, baseline-prestop-bad |
 | `observability/prometheus/` | Helm values for kube-prometheus-stack |
 | `scripts/` | run_scenario.sh, k6 load.js, collect_metrics.py, summarize_run.py |
 

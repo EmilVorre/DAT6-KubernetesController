@@ -1,0 +1,21 @@
+# Baseline strategy: controller runs but neither S1 (early readiness removal)
+# nor S2 (drain verification) is enabled. Reconciler should be a no-op for the
+# drainable-service pods. We still deploy it for symmetry so all three runs
+# share the same control-plane load profile.
+#
+# Strategic-merge does NOT remove env vars that exist in base, so we use a
+# JSON-patch-shaped strategic merge that explicitly sets env to only
+# RUST_LOG. If the base ever grows other env vars, list them here too — or
+# this overlay will silently turn into "whatever base ships".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dat6-controller
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          env:
+            - name: RUST_LOG
+              value: "info"
