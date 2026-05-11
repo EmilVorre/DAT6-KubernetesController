@@ -1,8 +1,32 @@
-# Baseline — no graceful shutdown, no controller strategy.
+# Baseline — "naive operator" persona.
 #
-# Deliberately omits `DAT6_GRACEFUL_DRAIN`: the process inherits the kernel
-# default for SIGTERM and dies immediately, dropping in-flight requests. This
-# is what we want to measure against for S1/S2.
+# This overlay represents an operator who knows enough about Kubernetes to
+# enable graceful shutdown in the application (DAT6_GRACEFUL_DRAIN=1) but
+# does NOT know much about their own workload's latency distribution.
+# Their reasoning when picking timeouts:
+#
+#   "Most of my requests take ~250ms; I'll set a tight grace so rollouts
+#    don't drag on. 2 seconds should be plenty."
+#
+# This is a realistic profile: many real services are deployed with
+# `terminationGracePeriodSeconds` left at a low value because the operator
+# is afraid that a high grace makes rollouts slow. (It doesn't, for
+# fast-draining pods — the kubelet only waits the *minimum* of grace and
+# actual exit time. But the misconception is widespread.)
+#
+# Predicted outcome under the bimodal workload (LONG_REQUESTS_PCT=5):
+#   * Short requests (95%, ~250ms): finish well inside the 1s drain budget.
+#   * Long-tail (5%, 2-10s): in-flight long-tail requests at SIGTERM time
+#     are CUT OFF when DAT6_DRAIN_MAX_SECS=1 expires; the kubelet then
+#     sends SIGKILL at t=2s. These cut-off requests appear as failed
+#     responses to the load generator.
+#
+# This is the failure mode we want to compare against — *not* "no app
+# cooperation at all" (which previous-generation Kubernetes would expose
+# as much higher loss, but which modern kube-proxy/EndpointSlice already
+# largely mitigates). Instead, the failure mode here is "app cooperation
+# WITH a wrong static drain timeout" — which the controller-driven
+# approaches (S1, S2) progressively eliminate.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,14 +34,17 @@ metadata:
 spec:
   template:
     spec:
-      terminationGracePeriodSeconds: 1
+      terminationGracePeriodSeconds: 2
       containers:
         - name: drainable-service
           env:
             - name: SLEEP_MS
-              value: "2000"
+              value: "250"
+            - name: LONG_REQUESTS_PCT
+              value: "5"
             - name: DAT6_GRACEFUL_DRAIN
-              value: "0"
+              value: "1"            # naive operator: knows about graceful shutdown
             - name: DAT6_DRAIN_MAX_SECS
-              value: "0"
-      # No preStop — baseline for comparison.
+              value: "1"            # naive operator: picks a "typical" timeout that
+                                    # doesn't fit the workload's tail
+      # No readinessGates — no controller in this persona.

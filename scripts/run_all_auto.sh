@@ -32,11 +32,10 @@
 #   AND remote k6 on any exit path (success, failure, Ctrl-C).
 # - Deletes the deployment between EVERY strat, not just baseline. This
 #   prevents kustomize strategic-merge from leaving env vars behind when
-#   an overlay's patch doesn't mention them (e.g. baseline → s1 leaks
-#   nothing; s1 → baseline leaks DAT6_GRACEFUL_DRAIN=1, which is what
-#   silently broke previous runs).
-# - Verifies the deployed pod's env after each apply. Halts the matrix
-#   if the env doesn't match what the strat is supposed to produce.
+#   an overlay's patch doesn't mention them.
+# - Verifies the deployed pod's env after each apply (graceful-drain + drain
+#   max seconds must match that overlay). Halts the matrix on mismatch so
+#   a stale merge can't silently poison a whole N×runs matrix.
 #
 # Pre-requisites:
 # - The dat6-controller image (ghcr.io/emilvorre/dat6-controller:latest) has
@@ -201,25 +200,49 @@ verify_env() {
   kubectl wait --for=condition=Ready pod -l app=drainable-service \
     --timeout=60s 2>/dev/null || true
 
-  local got
-  got="$(kubectl exec deploy/drainable-service -- env 2>/dev/null \
-    | grep -E '^DAT6_GRACEFUL_DRAIN=' || echo 'DAT6_GRACEFUL_DRAIN=<unset>')"
+  local env_out
+  env_out="$(kubectl exec deploy/drainable-service -- env 2>/dev/null || true)"
 
+  local got_graceful got_drain
+  got_graceful="$(echo "${env_out}" | grep -E '^DAT6_GRACEFUL_DRAIN=' \
+    || echo 'DAT6_GRACEFUL_DRAIN=<unset>')"
+  got_drain="$(echo "${env_out}" | grep -E '^DAT6_DRAIN_MAX_SECS=' \
+    || echo 'DAT6_DRAIN_MAX_SECS=<unset>')"
+
+  # Values must stay in sync with k8s/app/overlays/<strat>/deployment-patch.yaml
   case "${strat}" in
     baseline)
-      if [[ "${got}" == "DAT6_GRACEFUL_DRAIN=1" ]]; then
-        echo "ERROR: baseline pod has DAT6_GRACEFUL_DRAIN=1 (env-var leak)" >&2
+      if [[ "${got_graceful}" != "DAT6_GRACEFUL_DRAIN=1" ]]; then
+        echo "ERROR: baseline expected DAT6_GRACEFUL_DRAIN=1, got '${got_graceful}'" >&2
+        return 1
+      fi
+      if [[ "${got_drain}" != "DAT6_DRAIN_MAX_SECS=1" ]]; then
+        echo "ERROR: baseline expected DAT6_DRAIN_MAX_SECS=1, got '${got_drain}' (wrong overlay or merge leak?)" >&2
         return 1
       fi
       ;;
-    s1-early-readiness|s2-drain-verification)
-      if [[ "${got}" != "DAT6_GRACEFUL_DRAIN=1" ]]; then
-        echo "ERROR: ${strat} pod has '${got}', expected DAT6_GRACEFUL_DRAIN=1" >&2
+    s1-early-readiness)
+      if [[ "${got_graceful}" != "DAT6_GRACEFUL_DRAIN=1" ]]; then
+        echo "ERROR: ${strat} pod has '${got_graceful}', expected DAT6_GRACEFUL_DRAIN=1" >&2
+        return 1
+      fi
+      if [[ "${got_drain}" != "DAT6_DRAIN_MAX_SECS=8" ]]; then
+        echo "ERROR: ${strat} expected DAT6_DRAIN_MAX_SECS=8, got '${got_drain}'" >&2
+        return 1
+      fi
+      ;;
+    s2-drain-verification)
+      if [[ "${got_graceful}" != "DAT6_GRACEFUL_DRAIN=1" ]]; then
+        echo "ERROR: ${strat} pod has '${got_graceful}', expected DAT6_GRACEFUL_DRAIN=1" >&2
+        return 1
+      fi
+      if [[ "${got_drain}" != "DAT6_DRAIN_MAX_SECS=28" ]]; then
+        echo "ERROR: ${strat} expected DAT6_DRAIN_MAX_SECS=28, got '${got_drain}'" >&2
         return 1
       fi
       ;;
   esac
-  echo "  → Verified pod env: ${got}"
+  echo "  → Verified pod env: ${got_graceful}; ${got_drain}"
 }
 
 # ---------------------------------------------------------------------------

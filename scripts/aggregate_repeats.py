@@ -30,7 +30,14 @@ def main():
         p50 = data.get("p50_ms", 0)
         p95 = data.get("p95_ms", 0)
         p99 = data.get("p99_ms", 0)
-        rows.append((run_name, total, errors, loss_pct, p50, p95, p99))
+        sd_count = data.get("shutdown_count", 0)
+        sd_median = data.get("shutdown_median_secs", 0)
+        sd_p95 = data.get("shutdown_p95_secs", 0)
+        sd_max = data.get("shutdown_max_secs", 0)
+        rows.append(
+            (run_name, total, errors, loss_pct, p50, p95, p99,
+             sd_count, sd_median, sd_p95, sd_max)
+        )
 
     if not rows:
         print(f"No client_results.json found in {parent}/run_1..run_{n}", file=sys.stderr)
@@ -38,11 +45,17 @@ def main():
 
     # summary_repeats.csv
     csv_path = parent / "summary_repeats.csv"
-    header = "run,total,errors,loss_pct,p50_ms,p95_ms,p99_ms"
+    header = (
+        "run,total,errors,loss_pct,p50_ms,p95_ms,p99_ms,"
+        "shutdown_count,shutdown_median_secs,shutdown_p95_secs,shutdown_max_secs"
+    )
     with open(csv_path, "w") as f:
         f.write(header + "\n")
         for r in rows:
-            f.write(f"{r[0]},{r[1]},{r[2]},{r[3]:.2f},{r[4]:.2f},{r[5]:.2f},{r[6]:.2f}\n")
+            f.write(
+                f"{r[0]},{r[1]},{r[2]},{r[3]:.2f},{r[4]:.2f},{r[5]:.2f},{r[6]:.2f},"
+                f"{r[7]},{r[8]:.3f},{r[9]:.3f},{r[10]:.3f}\n"
+            )
     print(f"Wrote {csv_path} ({len(rows)} rows)")
 
     # aggregate.json: mean, min, max for numeric metrics
@@ -50,6 +63,9 @@ def main():
     p50_vals = [r[4] for r in rows]
     p95_vals = [r[5] for r in rows]
     p99_vals = [r[6] for r in rows]
+    sd_median_vals = [r[8] for r in rows if r[7] > 0]
+    sd_p95_vals = [r[9] for r in rows if r[7] > 0]
+    sd_max_vals = [r[10] for r in rows if r[7] > 0]
 
     def stats(vals):
         if not vals:
@@ -66,6 +82,9 @@ def main():
         "p50_ms": stats(p50_vals),
         "p95_ms": stats(p95_vals),
         "p99_ms": stats(p99_vals),
+        "shutdown_median_secs": stats(sd_median_vals),
+        "shutdown_p95_secs": stats(sd_p95_vals),
+        "shutdown_max_secs": stats(sd_max_vals),
     }
     agg_path = parent / "aggregate.json"
     with open(agg_path, "w") as f:

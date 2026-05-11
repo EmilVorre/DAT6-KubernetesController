@@ -1,20 +1,47 @@
-# S2 — Active Drain Verification (builds on S1 readiness-gate setup).
+# S2 — "operator-trusts-controller" persona.
 #
-# Requires the controller to be running with both:
-#   DAT6_EARLY_READINESS_REMOVAL=1
-#   DAT6_DRAIN_VERIFICATION=1
+# This overlay represents an operator who has adopted the full controller
+# stack: gate-flip routing removal (S1) + finalizer-held drain
+# verification (S2). They no longer have to guess a drain timeout that
+# fits their worst-case latency tail, because the controller polls the
+# app's `/drainez` endpoint and removes the finalizer the instant the
+# app reports `ready_to_delete: true`. The operator can therefore set
+# generous grace + drain budgets without worrying about slow rollouts:
+# the controller's adaptive release means pods exit as fast as their
+# actual in-flight work allows.
 #
-# The controller adds the `decomposition.dat6.io/finalizer` to running pods so
-# that pod resource deletion is held until `/drainez` reports
-# `ready_to_delete: true`. The finalizer must be added *before* the pod
-# starts terminating; if the controller is not running when pods are created
-# it will best-effort patch the finalizer when termination is observed, but
-# that path is racy and not recommended.
+# Their reasoning when picking timeouts:
 #
-# `DAT6_GRACEFUL_DRAIN=1` is required: the controller's `/drainez` poll only
-# works while the app is still alive. Without graceful drain the process
-# would exit on SIGTERM before any poll could succeed, and S2's deletion
-# gating would degrade to a no-op fallback.
+#   "I don't know my workload's exact tail and I don't have to. The
+#    controller will release each pod as soon as it's actually drained.
+#    I'll set grace to the Kubernetes default (30s) as a safety net."
+#
+# Required controller env (set in k8s/controller/overlays/s2-...):
+#   DAT6_EARLY_READINESS_REMOVAL=1   (gate flip on terminationDetected)
+#   DAT6_DRAIN_VERIFICATION=1        (finalizer + /drainez polling)
+#
+# Predicted outcome under the bimodal workload (LONG_REQUESTS_PCT=5):
+#   * All in-flight requests, including the long-tail (max 10s), complete
+#     before the controller releases the finalizer.
+#   * Zero request loss.
+#   * Per-pod shutdown duration adapts to the actual long-tail at SIGTERM
+#     time: typically far less than the 28s upper bound, often <10s.
+#
+# Why DAT6_DRAIN_MAX_SECS is high (28) here vs S1's 8
+# ---------------------------------------------------
+# It's a *safety net*, not the primary release mechanism. The controller's
+# /drainez polling is what releases each pod in the typical case; the app
+# only falls back to its static timeout if the controller is unreachable
+# or the finalizer is somehow stuck. Set just below grace=30 so the app
+# exits cleanly before the kubelet sends SIGKILL.
+#
+# Fallback (degradation to S1)
+# ----------------------------
+# If `/drainez` is genuinely unreachable past the pod's grace period
+# (e.g. the app crashed mid-drain), the controller removes the finalizer
+# anyway to avoid deadlocking pod deletion. In that pathological case S2
+# degrades to S1's behaviour — a deliberate liveness-over-strictness
+# trade-off in the controller.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,15 +49,17 @@ metadata:
 spec:
   template:
     spec:
-      terminationGracePeriodSeconds: 1
+      terminationGracePeriodSeconds: 30
       containers:
         - name: drainable-service
           env:
             - name: SLEEP_MS
-              value: "2000"
+              value: "250"
+            - name: LONG_REQUESTS_PCT
+              value: "5"
             - name: DAT6_GRACEFUL_DRAIN
               value: "1"
             - name: DAT6_DRAIN_MAX_SECS
-              value: "28"
+              value: "28"           # safety net only; controller releases via /drainez
       readinessGates:
         - conditionType: decomposition.dat6.io/drain

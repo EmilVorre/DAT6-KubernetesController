@@ -53,6 +53,26 @@ def main():
     p95 = durations_sorted[int(n * 0.95)] if n > 0 else 0
     p99 = durations_sorted[int(n * 0.99)] if n > 0 else 0
 
+    # Pull pod-shutdown timing from extract_shutdown_durations.py output
+    # (written by run_scenario.sh just before this script runs). Best-effort:
+    # if the file is missing or malformed, fall back to zeros so the rest
+    # of the aggregation pipeline still works.
+    sd_count = 0
+    sd_median = 0.0
+    sd_p95 = 0.0
+    sd_max = 0.0
+    sd_file = output_dir / "shutdown_durations.json"
+    if sd_file.exists():
+        try:
+            sd = json.loads(sd_file.read_text())
+            stats = sd.get("stats", {})
+            sd_count = int(stats.get("count", 0))
+            sd_median = float(stats.get("median_secs", 0))
+            sd_p95 = float(stats.get("p95_secs", 0))
+            sd_max = float(stats.get("max_secs", 0))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
     summary = {
         "total_requests": total,
         "errors": errors,
@@ -60,14 +80,25 @@ def main():
         "p50_ms": round(p50, 2),
         "p95_ms": round(p95, 2),
         "p99_ms": round(p99, 2),
+        "shutdown_count": sd_count,
+        "shutdown_median_secs": round(sd_median, 3),
+        "shutdown_p95_secs": round(sd_p95, 3),
+        "shutdown_max_secs": round(sd_max, 3),
     }
 
     with open(output_dir / "client_results.json", "w") as f:
         json.dump(summary, f, indent=2)
 
     # CSV row
-    csv_row = f"{output_dir.name},{total},{errors},{loss_pct:.2f},{p50:.2f},{p95:.2f},{p99:.2f}"
-    csv_header = "run,total,errors,loss_pct,p50_ms,p95_ms,p99_ms"
+    csv_row = (
+        f"{output_dir.name},{total},{errors},{loss_pct:.2f},"
+        f"{p50:.2f},{p95:.2f},{p99:.2f},"
+        f"{sd_count},{sd_median:.3f},{sd_p95:.3f},{sd_max:.3f}"
+    )
+    csv_header = (
+        "run,total,errors,loss_pct,p50_ms,p95_ms,p99_ms,"
+        "shutdown_count,shutdown_median_secs,shutdown_p95_secs,shutdown_max_secs"
+    )
     csv_file = output_dir / "summary.csv"
     if not csv_file.exists():
         with open(csv_file, "w") as f:
@@ -75,7 +106,10 @@ def main():
     with open(csv_file, "a") as f:
         f.write(csv_row + "\n")
 
-    print(f"Summary: loss={loss_pct:.2f}% p99={p99:.0f}ms")
+    print(
+        f"Summary: loss={loss_pct:.2f}% p99={p99:.0f}ms "
+        f"shutdown_median={sd_median:.2f}s ({sd_count} pods)"
+    )
     print(f"Written: {output_dir}/client_results.json, {output_dir}/summary.csv")
 
 if __name__ == "__main__":

@@ -92,10 +92,25 @@ EV_LOG_SNAPSHOT="${OUTPUT_DIR}/k8s_events_snapshot.log"
 kubectl get events --watch-only > "${EV_LOG_WATCH}" 2>/dev/null &
 EV_PID=$!
 
-# Cleanup trap covers Ctrl-C / errors. Kills both local event watcher
-# and remote k6 (if it started).
+# --- start pod state watch ---
+# Streams a JSON-line per pod state change (ADDED/MODIFIED/DELETED) for every
+# drainable-service pod. This is what gives us absolute-timestamped per-pod
+# lifecycle data: deletionTimestamp, terminationGracePeriodSeconds, and
+# containerStatuses[*].state.terminated.{startedAt,finishedAt}. The default
+# `kubectl get events` text output only has relative timestamps ("0s",
+# "1s") which is useless for measuring shutdown duration; the watch below
+# is the source of truth for `extract_shutdown_durations.py`.
+POD_WATCH_LOG="${OUTPUT_DIR}/pod_states_watch.jsonl"
+kubectl get pods -l app=drainable-service \
+  --output-watch-events --watch -o json \
+  > "${POD_WATCH_LOG}" 2>/dev/null &
+POD_WATCH_PID=$!
+
+# Cleanup trap covers Ctrl-C / errors. Kills local event watchers and
+# remote k6 (if it started).
 cleanup_local() {
   kill "${EV_PID}" 2>/dev/null || true
+  kill "${POD_WATCH_PID}" 2>/dev/null || true
   ssh -o ConnectTimeout=5 "${LOAD_HOST}" \
     'pkill -9 k6 2>/dev/null || true' 2>/dev/null || true
 }
@@ -145,6 +160,8 @@ scp -q "${LOAD_HOST}:/tmp/k6_results.json" "${OUTPUT_DIR}/k6_results.json"
 # --- collect events ---
 kill "${EV_PID}" 2>/dev/null || true
 wait "${EV_PID}" 2>/dev/null || true
+kill "${POD_WATCH_PID}" 2>/dev/null || true
+wait "${POD_WATCH_PID}" 2>/dev/null || true
 trap - EXIT INT TERM
 
 kubectl get events --sort-by='.lastTimestamp' > "${EV_LOG_SNAPSHOT}" 2>/dev/null || true
@@ -158,6 +175,7 @@ kubectl get events --sort-by='.lastTimestamp' > "${EV_LOG_SNAPSHOT}" 2>/dev/null
 
 # --- summarize ---
 python3 "${ROOT_DIR}/scripts/collect_metrics.py" "${OUTPUT_DIR}" 2>/dev/null || true
+python3 "${ROOT_DIR}/scripts/extract_shutdown_durations.py" "${OUTPUT_DIR}" 2>/dev/null || true
 python3 "${ROOT_DIR}/scripts/summarize_run.py" "${OUTPUT_DIR}"
 
 echo "    → done"

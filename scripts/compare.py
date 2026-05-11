@@ -15,25 +15,45 @@ def summarize_summary_csv(path: Path):
         return None
     loss = [float(r["loss_pct"]) for r in rows]
     p99 = [float(r["p99_ms"]) for r in rows]
+
+    # Shutdown timing columns may be missing on legacy summary_repeats.csv
+    # files written before extract_shutdown_durations.py was added; treat
+    # them as zero so old runs still aggregate cleanly.
+    def numcol(row, key):
+        try:
+            return float(row.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    sd_median = [numcol(r, "shutdown_median_secs") for r in rows]
+    sd_p95 = [numcol(r, "shutdown_p95_secs") for r in rows]
+    sd_max = [numcol(r, "shutdown_max_secs") for r in rows]
+    sd_count_total = sum(int(numcol(r, "shutdown_count")) for r in rows)
+
     return {
         "runs": len(rows),
         "mean_loss_pct": statistics.mean(loss),
         "stddev_loss_pct": statistics.pstdev(loss) if len(loss) > 1 else 0.0,
         "p99_mean": statistics.mean(p99),
         "p99_max": max(p99),
+        "shutdown_pods": sd_count_total,
+        "shutdown_median_mean": statistics.mean(sd_median) if sd_median else 0.0,
+        "shutdown_p95_mean": statistics.mean(sd_p95) if sd_p95 else 0.0,
+        "shutdown_max_overall": max(sd_max) if sd_max else 0.0,
     }
 
 
 def markdown_table(rows):
     lines = [
-        "| scenario | strat | runs | mean_loss% | stddev | p99_mean | p99_max |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "| scenario | strat | runs | mean_loss% | stddev | p99_mean | p99_max | sd_pods | sd_median_s | sd_p95_s | sd_max_s |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
-            "| {scenario} | {strat} | {runs} | {mean_loss_pct:.2f} | {stddev_loss_pct:.2f} | {p99_mean:.2f} | {p99_max:.2f} |".format(
-                **row
-            )
+            "| {scenario} | {strat} | {runs} | {mean_loss_pct:.2f} | "
+            "{stddev_loss_pct:.2f} | {p99_mean:.2f} | {p99_max:.2f} | "
+            "{shutdown_pods} | {shutdown_median_mean:.2f} | "
+            "{shutdown_p95_mean:.2f} | {shutdown_max_overall:.2f} |".format(**row)
         )
     return "\n".join(lines) + "\n"
 
@@ -73,7 +93,13 @@ def main():
         return 1
 
     csv_path = compare_dir / "comparison.csv"
-    fields = ["scenario", "strat", "runs", "mean_loss_pct", "stddev_loss_pct", "p99_mean", "p99_max"]
+    fields = [
+        "scenario", "strat", "runs",
+        "mean_loss_pct", "stddev_loss_pct",
+        "p99_mean", "p99_max",
+        "shutdown_pods", "shutdown_median_mean",
+        "shutdown_p95_mean", "shutdown_max_overall",
+    ]
     with csv_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -82,12 +108,20 @@ def main():
     md_path = compare_dir / "comparison.md"
     md_path.write_text(markdown_table(output_rows))
 
-    print("scenario            strat                    runs  mean_loss%  stddev  p99_mean  p99_max")
+    print(
+        "scenario            strat                    runs  "
+        "mean_loss%  stddev  p99_mean  p99_max  sd_pods  "
+        "sd_med_s  sd_p95_s  sd_max_s"
+    )
     for r in output_rows:
         print(
             f"{r['scenario']:<19} {r['strat']:<24} {r['runs']:>4}  "
             f"{r['mean_loss_pct']:>9.2f}  {r['stddev_loss_pct']:>6.2f}  "
-            f"{r['p99_mean']:>8.2f}  {r['p99_max']:>7.2f}"
+            f"{r['p99_mean']:>8.2f}  {r['p99_max']:>7.2f}  "
+            f"{r['shutdown_pods']:>7}  "
+            f"{r['shutdown_median_mean']:>7.2f}  "
+            f"{r['shutdown_p95_mean']:>7.2f}  "
+            f"{r['shutdown_max_overall']:>7.2f}"
         )
     print(f"\nWrote {csv_path}")
     print(f"Wrote {md_path}")

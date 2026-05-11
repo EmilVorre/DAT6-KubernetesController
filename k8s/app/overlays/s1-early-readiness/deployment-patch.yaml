@@ -1,11 +1,33 @@
-# S1 — Early Readiness Removal
-# Adds a custom readiness gate so the controller can set it to False when the pod
-# is terminating, removing the pod from Service endpoints before preStop/grace.
+# S1 — "informed operator + readiness-gate controller" persona.
 #
-# `DAT6_GRACEFUL_DRAIN=1` makes the app keep serving in-flight requests on
-# SIGTERM (instead of dying immediately, like the baseline does). Without this
-# the early-readiness-removal strategy only protects *new* requests; in-flight
-# ones would still be lost when the kubelet kills the container.
+# This overlay represents an operator who has done some empirical work:
+# they measured their service's latency and saw p95 ≈ 5s due to the long
+# tail. They've decided to set a drain budget that fits *most* of the
+# tail and accept some loss for the worst case. They've also adopted the
+# controller's S1 readiness-gate strategy because it removes the need
+# for a per-deployment preStop+sleep hook to handle the EndpointSlice
+# propagation race.
+#
+# Their reasoning when picking timeouts:
+#
+#   "p95 was 5s, I'll give 8s of drain budget and 10s grace as a safety
+#    margin. The controller handles routing removal; I handle drain."
+#
+# Predicted outcome under the bimodal workload (LONG_REQUESTS_PCT=5):
+#   * Short requests: finish well inside 8s budget.
+#   * Long-tail at the lower end (2-7s): finish before drain timeout.
+#   * Long-tail at the upper end (8-10s): cut off when DAT6_DRAIN_MAX_SECS=8
+#     expires. Less loss than baseline (most long-tail completes), but
+#     non-zero — the operator's static guess can't cover the worst case
+#     without overprovisioning grace globally.
+#
+# What S1 buys vs baseline
+# ------------------------
+# 1. Routing-removal is controller-driven (no per-deployment preStop).
+# 2. Drain budget is large enough to cover most of the workload.
+# 3. BUT: the static drain timeout is still a guess. If the workload's
+#    tail extends beyond the timeout, requests are dropped — which is
+#    structurally what S2 fixes via active verification.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,17 +35,18 @@ metadata:
 spec:
   template:
     spec:
-      terminationGracePeriodSeconds: 1
+      terminationGracePeriodSeconds: 10
       containers:
         - name: drainable-service
           env:
             - name: SLEEP_MS
-              value: "2000"
+              value: "250"
+            - name: LONG_REQUESTS_PCT
+              value: "5"
             - name: DAT6_GRACEFUL_DRAIN
               value: "1"
             - name: DAT6_DRAIN_MAX_SECS
-              value: "28"
+              value: "8"            # informed operator: drain budget covers the typical
+                                    # long-tail but not its worst case
       readinessGates:
         - conditionType: decomposition.dat6.io/drain
-      # No preStop — S1 removes traffic via readiness gate; the app handles
-      # SIGTERM-driven graceful drain itself.

@@ -206,20 +206,23 @@ async fn root_handler(State(state): State<AppState>) -> impl IntoResponse {
     state.in_flight.inc();
     let _guard = InFlightGuard { state: &state };
 
-    let sleep_duration = if state.sleep_ms > 0 {
+    // Bimodal latency: if LONG_REQUESTS_PCT>0, that fraction of requests
+    // sleep 2-10s (long-tail injection); the rest fall through to SLEEP_MS.
+    // Previously the long-tail branch was gated on SLEEP_MS==0, which meant
+    // overlays setting SLEEP_MS to a non-zero "typical" latency *silently
+    // disabled* the bimodal mode — defeating the workload realism the
+    // strategies are meant to differentiate on.
+    let pct: u32 = std::env::var("LONG_REQUESTS_PCT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let sleep_duration = if pct > 0 && (rand_simple() % 100) < pct {
+        let secs = 2 + (rand_simple() % 9) as u64;
+        Duration::from_secs(secs)
+    } else if state.sleep_ms > 0 {
         Duration::from_millis(state.sleep_ms)
     } else {
-        // Fault injection: 5% long requests (2–10s) when LONG_REQUESTS_PCT=5
-        let pct: u32 = std::env::var("LONG_REQUESTS_PCT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if pct > 0 && (rand_simple() % 100) < pct {
-            let secs = 2 + (rand_simple() % 9) as u64;
-            Duration::from_secs(secs)
-        } else {
-            Duration::ZERO
-        }
+        Duration::ZERO
     };
 
     if !sleep_duration.is_zero() {
